@@ -4,7 +4,6 @@ import datetime as dt
 import json
 import os
 import re
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -12,7 +11,6 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 from curl_cffi import requests as curl_requests
-from rapidfuzz import fuzz
 
 from .config import Settings
 from .utils import json_dumps, normalize_name, slugify
@@ -263,7 +261,7 @@ def _extract_cards_from_live_page(search_url: str) -> list[ReferenceCard]:
             page.wait_for_timeout(1200)
 
         raw_cards = page.locator("a[href*='/card/']").evaluate_all(
-            """
+            r"""
             (anchors) => anchors.map((anchor) => {
               const text = (anchor.textContent || '').replace(/\s+/g, ' ').trim();
               let current = anchor;
@@ -350,6 +348,22 @@ def _extract_cards_from_list_pages(list_urls: list[str], entity_type: str, setti
             if len(card.name) > len(existing.name):
                 existing.name = card.name
     return list(merged.values())
+
+
+def _extract_run_card_urls(settings: Settings) -> list[str]:
+    urls: set[str] = set()
+    for html_path in settings.raw_runs_dir.glob("run_*.html"):
+        try:
+            html = html_path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        soup = BeautifulSoup(html, "html.parser")
+        for anchor in soup.select("a[href*='/card/']"):
+            href = anchor.get("href")
+            if not href:
+                continue
+            urls.add(urljoin("https://bazaardb.gg/", href))
+    return sorted(urls)
 
 
 def _extract_card_from_html(html: str, card_url: str) -> ReferenceCard | None:
@@ -488,57 +502,6 @@ def build_reference_catalog(conn, settings: Settings) -> dict[str, int]:
                     print(f"[reference] {entity_type} list sync {index}/{len(cards)}", flush=True)
         counts[entity_type] += len(cards)
     card_urls = [url for url in sitemap_urls if "/card/" in url]
-    sitemap_candidates = [
-        {
-            "entity_id": _extract_card_id(url),
-            "page_url": url,
-            "name": _candidate_name_from_url(url),
-            "normalized_name": normalize_name(_candidate_name_from_url(url)),
-        }
-        for url in card_urls
-    ]
-
-    item_hint_counter: Counter[str] = Counter()
-    for row in conn.execute("SELECT item_hints_json FROM posts").fetchall():
-        for item in json.loads(row[0]):
-            if item:
-                item_hint_counter[item] += 1
-
-    prioritized_item_urls: list[str] = []
-    for hint, hint_count in item_hint_counter.most_common():
-        normalized_hint = normalize_name(hint)
-        best = max(
-            sitemap_candidates,
-            key=lambda candidate: fuzz.token_sort_ratio(normalized_hint, candidate["normalized_name"]),
-        )
-        score = fuzz.token_sort_ratio(normalized_hint, best["normalized_name"])
-        if score < 84:
-            continue
-        conn.execute(
-            """
-            INSERT INTO reference_items(entity_id, name, normalized_name, slug, page_url, aliases_json, metadata_json, collected_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(entity_id) DO UPDATE SET
-                name=excluded.name,
-                normalized_name=excluded.normalized_name,
-                slug=excluded.slug,
-                page_url=excluded.page_url,
-                aliases_json=excluded.aliases_json,
-                metadata_json=excluded.metadata_json,
-                collected_at=excluded.collected_at
-            """,
-            (
-                best["entity_id"],
-                best["name"],
-                best["normalized_name"],
-                slugify(best["name"]),
-                best["page_url"],
-                json_dumps(sorted({hint, best["name"]})),
-                json_dumps({"source": "post_hint_sitemap_match", "matched_hint": hint, "match_score": score, "hint_count": hint_count}),
-                now,
-            ),
-        )
-        prioritized_item_urls.append(best["page_url"])
 
     known_ids = {
         row[0]
@@ -553,15 +516,18 @@ def build_reference_catalog(conn, settings: Settings) -> dict[str, int]:
             "SELECT page_url FROM reference_items WHERE image_path IS NULL ORDER BY name"
         ).fetchall()
     ]
-    enrichment_urls = list(dict.fromkeys([*prioritized_item_urls, *existing_missing_urls]))
+    run_card_urls = _extract_run_card_urls(settings)
+    enrichment_urls = list(dict.fromkeys([*existing_missing_urls, *run_card_urls]))
 
-    # Keep the default run focused on the relevant Jules universe.
+    # The default run should always cover cards that appear in the crawled runs.
+    # Only the broader sitemap backfill is gated behind the explicit full flag.
     if os.environ.get("BAZAR_REFERENCE_FULL", "0") == "1":
-        enrichment_urls = sorted({*enrichment_urls, *card_urls})
+        enrichment_urls = list(dict.fromkeys([*enrichment_urls, *sorted(card_urls)]))
 
     batch_size = int(os.environ.get("BAZAR_REFERENCE_BATCH_SIZE", "25"))
     page_delay_ms = int(os.environ.get("BAZAR_REFERENCE_DELAY_MS", "2500"))
-    enrichment_urls = enrichment_urls[:batch_size]
+    if os.environ.get("BAZAR_REFERENCE_FULL", "0") == "1":
+        enrichment_urls = enrichment_urls[: max(batch_size, len(run_card_urls) + len(existing_missing_urls))]
 
     with httpx.Client(headers={"User-Agent": "Mozilla/5.0"}, timeout=60.0, follow_redirects=True) as client:
         print(f"[reference] enriching {len(enrichment_urls)} card pages", flush=True)

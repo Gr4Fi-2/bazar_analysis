@@ -49,10 +49,3 @@ def parse_score_from_title(title: str) -> tuple[int | None, int | None]:
         return None, None
     return int(match.group(1)), int(match.group(2))
 
-
-def parse_rank_from_title(title: str) -> str | None:
-    lowered = title.lower()
-    for tier in ["legend", "diamond", "gold", "silver", "bronze"]:
-        if tier in lowered:
-            return tier.title()
-    return None

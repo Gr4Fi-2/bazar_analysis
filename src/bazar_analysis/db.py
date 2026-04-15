@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
@@ -11,26 +10,39 @@ from .config import Settings
 
 
 SCHEMA = """
-CREATE SEQUENCE IF NOT EXISTS posts_id_seq START 1;
-CREATE TABLE IF NOT EXISTS posts (
-    post_id BIGINT PRIMARY KEY DEFAULT nextval('posts_id_seq'),
+CREATE SEQUENCE IF NOT EXISTS runs_id_seq START 1;
+CREATE TABLE IF NOT EXISTS runs (
+    run_id BIGINT PRIMARY KEY DEFAULT nextval('runs_id_seq'),
+    source_run_id VARCHAR NOT NULL UNIQUE,
     hero VARCHAR NOT NULL,
-    post_url VARCHAR NOT NULL UNIQUE,
+    run_url VARCHAR NOT NULL UNIQUE,
+    created_at VARCHAR,
     title VARCHAR NOT NULL,
-    post_date VARCHAR,
-    author VARCHAR,
+    profile_name VARCHAR,
+    profile_url VARCHAR,
+    outcome_text VARCHAR,
+    record_wins INTEGER,
+    record_losses INTEGER,
+    rank_tier VARCHAR,
+    run_outcome_tier VARCHAR,
+    run_wins_label VARCHAR,
+    player_rank_tier VARCHAR,
+    max_health INTEGER,
+    prestige INTEGER,
+    level INTEGER,
+    income INTEGER,
+    gold INTEGER,
     html_path VARCHAR,
-    score_wins INTEGER,
-    score_losses INTEGER,
-    rank_title_hint VARCHAR,
-    item_hints_json JSON NOT NULL DEFAULT '[]',
+    card_hints_json JSON NOT NULL DEFAULT '[]',
+    board_cards_json JSON NOT NULL DEFAULT '[]',
+    skill_cards_json JSON NOT NULL DEFAULT '[]',
     crawled_at VARCHAR NOT NULL
 );
 
 CREATE SEQUENCE IF NOT EXISTS screenshots_id_seq START 1;
 CREATE TABLE IF NOT EXISTS screenshots (
     screenshot_id BIGINT PRIMARY KEY DEFAULT nextval('screenshots_id_seq'),
-    post_id BIGINT NOT NULL,
+    run_id BIGINT NOT NULL,
     screenshot_url VARCHAR NOT NULL,
     local_path VARCHAR,
     sha256 VARCHAR,
@@ -38,7 +50,7 @@ CREATE TABLE IF NOT EXISTS screenshots (
     height INTEGER,
     is_primary INTEGER NOT NULL DEFAULT 0,
     downloaded_at VARCHAR,
-    UNIQUE(post_id, screenshot_url)
+    UNIQUE(run_id, screenshot_url)
 );
 
 CREATE TABLE IF NOT EXISTS reference_items (
@@ -136,7 +148,7 @@ CREATE TABLE IF NOT EXISTS review_queue (
 
 
 TABLES = [
-    "posts",
+    "runs",
     "screenshots",
     "reference_items",
     "reference_skills",
@@ -145,6 +157,31 @@ TABLES = [
     "extracted_ranks",
     "review_queue",
 ]
+
+
+PIPELINE_TABLES = [
+    "runs",
+    "screenshots",
+    "extracted_board_items",
+    "extracted_skills",
+    "extracted_ranks",
+    "review_queue",
+]
+
+
+PIPELINE_SEQUENCES = [
+    "runs_id_seq",
+    "screenshots_id_seq",
+    "extracted_board_items_id_seq",
+    "extracted_skills_id_seq",
+    "review_queue_id_seq",
+]
+
+
+LEGACY_PIPELINE_TABLES = ["posts"]
+
+
+LEGACY_PIPELINE_SEQUENCES = ["posts_id_seq"]
 
 
 class Row:
@@ -222,33 +259,58 @@ class DatabaseConnection:
         self._conn.close()
 
 
+def _table_exists(conn: DatabaseConnection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT COUNT(*) AS table_count FROM information_schema.tables WHERE table_name = ?",
+        (table,),
+    ).fetchone()
+    return bool(row and row["table_count"])
+
+
+def _table_columns(conn: DatabaseConnection, table: str) -> set[str]:
+    if not _table_exists(conn, table):
+        return set()
+    rows = conn.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+        (table,),
+    ).fetchall()
+    return {row["column_name"] for row in rows}
+
+
 def _table_has_rows(conn: DatabaseConnection, table: str) -> bool:
     row = conn.execute(f"SELECT COUNT(*) AS row_count FROM {table}").fetchone()
     return bool(row and row["row_count"])
 
 
-def _migrate_sqlite_if_needed(conn: DatabaseConnection, sqlite_path: Path) -> None:
-    if conn.path.exists() and any(_table_has_rows(conn, table) for table in TABLES):
-        return
-    if not sqlite_path.exists():
-        return
+def _requires_pipeline_reset(conn: DatabaseConnection) -> bool:
+    run_columns = _table_columns(conn, "runs")
+    screenshot_columns = _table_columns(conn, "screenshots")
+    if _table_exists(conn, "posts"):
+        return True
+    if run_columns and {
+        "run_id",
+        "source_run_id",
+        "run_url",
+        "created_at",
+        "card_hints_json",
+        "run_outcome_tier",
+        "run_wins_label",
+        "player_rank_tier",
+        "board_cards_json",
+        "skill_cards_json",
+    } - run_columns:
+        return True
+    if screenshot_columns and "run_id" not in screenshot_columns:
+        return True
+    return False
 
-    sqlite_conn = sqlite3.connect(sqlite_path)
-    try:
-        for table in TABLES:
-            rows = sqlite_conn.execute(f"SELECT * FROM {table}").fetchall()
-            if not rows:
-                continue
-            columns = [column[1] for column in sqlite_conn.execute(f"PRAGMA table_info({table})").fetchall()]
-            placeholders = ", ".join(["?"] * len(columns))
-            column_list = ", ".join(columns)
-            conn.executemany(
-                f"INSERT INTO {table} ({column_list}) VALUES ({placeholders})",
-                rows,
-            )
-        conn.commit()
-    finally:
-        sqlite_conn.close()
+
+def _reset_pipeline_schema(conn: DatabaseConnection) -> None:
+    for table in [*PIPELINE_TABLES, *LEGACY_PIPELINE_TABLES]:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    for sequence in [*PIPELINE_SEQUENCES, *LEGACY_PIPELINE_SEQUENCES]:
+        conn.execute(f"DROP SEQUENCE IF EXISTS {sequence}")
+    conn.commit()
 
 
 def next_id(conn: DatabaseConnection, table: str, id_column: str) -> int:
@@ -261,12 +323,11 @@ def connect(database_path: Path) -> DatabaseConnection:
 
 
 def init_db(settings: Settings) -> DatabaseConnection:
-    database_existed = settings.duckdb_path.exists()
     conn = connect(settings.duckdb_path)
+    if _requires_pipeline_reset(conn):
+        _reset_pipeline_schema(conn)
     conn.execute_script(SCHEMA)
     conn.commit()
-    if not database_existed:
-        _migrate_sqlite_if_needed(conn, settings.sqlite_legacy_path)
     return conn
 
 

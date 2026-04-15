@@ -4,7 +4,7 @@ from .config import Settings
 
 
 TABLES = [
-    "posts",
+    "runs",
     "screenshots",
     "reference_items",
     "reference_skills",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
 
 
 @dataclass(frozen=True)
@@ -9,7 +10,7 @@ class Settings:
     project_root: Path
     data_dir: Path
     raw_dir: Path
-    raw_posts_dir: Path
+    raw_runs_dir: Path
     raw_screenshots_dir: Path
     reference_dir: Path
     reference_html_dir: Path
@@ -25,7 +26,6 @@ class Settings:
     exports_dir: Path
     db_dir: Path
     duckdb_path: Path
-    sqlite_legacy_path: Path
 
 
 def get_settings() -> Settings:
@@ -35,7 +35,7 @@ def get_settings() -> Settings:
         project_root=project_root,
         data_dir=data_dir,
         raw_dir=data_dir / "raw",
-        raw_posts_dir=data_dir / "raw" / "posts_html",
+        raw_runs_dir=data_dir / "raw" / "runs_html",
         raw_screenshots_dir=data_dir / "raw" / "screenshots",
         reference_dir=data_dir / "reference",
         reference_html_dir=data_dir / "reference" / "html",
@@ -51,7 +51,6 @@ def get_settings() -> Settings:
         exports_dir=data_dir / "exports",
         db_dir=data_dir / "db",
         duckdb_path=data_dir / "db" / "bazar_analysis.duckdb",
-        sqlite_legacy_path=data_dir / "db" / "bazar_analysis.sqlite",
     )
 
 
@@ -59,7 +58,7 @@ def ensure_directories(settings: Settings) -> None:
     for path in [
         settings.data_dir,
         settings.raw_dir,
-        settings.raw_posts_dir,
+        settings.raw_runs_dir,
         settings.raw_screenshots_dir,
         settings.reference_dir,
         settings.reference_html_dir,
@@ -76,3 +75,23 @@ def ensure_directories(settings: Settings) -> None:
         settings.db_dir,
     ]:
         path.mkdir(parents=True, exist_ok=True)
+
+
+def reset_workspace_data(settings: Settings) -> None:
+    paths_to_remove = [
+        settings.raw_runs_dir,
+        settings.raw_screenshots_dir,
+        settings.reference_dir,
+        settings.debug_dir,
+        settings.exports_dir,
+        settings.duckdb_path,
+    ]
+    legacy_paths_to_remove = [
+        settings.db_dir / "bazar_analysis.sqlite",
+        settings.raw_dir / "posts_html",
+    ]
+    for path in [*paths_to_remove, *legacy_paths_to_remove]:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.exists():
+            path.unlink(missing_ok=True)

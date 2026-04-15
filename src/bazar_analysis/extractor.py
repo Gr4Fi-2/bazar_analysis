@@ -36,12 +36,153 @@ def _load_reference_sets(conn):
     return item_features, skill_features
 
 
-def _hint_matched_item_features(item_features, item_hints: list[str]):
-    if not item_hints:
-        return item_features
-    normalized_hints = {normalize_name(hint) for hint in item_hints if hint.strip()}
-    matched = [feature for feature in item_features if feature.normalized_name in normalized_hints]
-    return matched or item_features
+def _hint_matched_features(features, card_hints: list[str]):
+    if not card_hints:
+        return features
+    normalized_hints = {normalize_name(hint) for hint in card_hints if hint.strip()}
+    matched = [feature for feature in features if feature.normalized_name in normalized_hints]
+    return matched or features
+
+
+def _load_reference_lookup(conn, table: str) -> dict[str, dict[str, str]]:
+    rows = conn.execute(f"SELECT entity_id, name, normalized_name, aliases_json FROM {table} ORDER BY name").fetchall()
+    lookup: dict[str, dict[str, str]] = {}
+    for row in rows:
+        keys = {row["normalized_name"]}
+        for alias in json.loads(row["aliases_json"] or "[]"):
+            if alias:
+                keys.add(normalize_name(alias))
+        for key in keys:
+            lookup.setdefault(key, {"entity_id": row["entity_id"], "name": row["name"]})
+    return lookup
+
+
+def _parse_embedded_cards(cards_json: str | None) -> list[dict]:
+    if not cards_json:
+        return []
+    try:
+        parsed = json.loads(cards_json)
+    except json.JSONDecodeError:
+        return []
+    return [card for card in parsed if isinstance(card, dict)]
+
+
+def _resolve_reference_card(card_title: str | None, lookup: dict[str, dict[str, str]]) -> tuple[str | None, str | None]:
+    if not card_title:
+        return None, None
+    resolved = lookup.get(normalize_name(card_title))
+    if resolved is None:
+        return None, card_title
+    return resolved["entity_id"], resolved["name"]
+
+
+def _insert_exact_board_cards(conn, screenshot_id: int, cards: list[dict], lookup: dict[str, dict[str, str]]) -> int:
+    inserted_rows: list[tuple[int, str]] = []
+    ordered_cards = sorted(enumerate(cards), key=lambda item: (int(item[1].get("slot_position") or item[0]), item[0]))
+    for index, card in ordered_cards:
+        slot_index = int(card.get("slot_position") or index)
+        source_title = card.get("title")
+        entity_id, resolved_name = _resolve_reference_card(source_title, lookup)
+        raw_label = resolved_name or source_title or card.get("base_id") or f"board_{slot_index}"
+        detection_id = next_id(conn, "extracted_board_items", "detection_id")
+        payload = json.dumps(
+            [
+                {
+                    "source": "run_detail_board",
+                    "base_id": card.get("base_id"),
+                    "title": source_title,
+                    "resolved_entity_id": entity_id,
+                    "resolved_name": resolved_name,
+                    "slot_position": slot_index,
+                    "tier": card.get("tier"),
+                    "enchantment": card.get("enchantment"),
+                }
+            ],
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        conn.execute(
+            """
+            INSERT INTO extracted_board_items(detection_id, screenshot_id, slot_index, entity_id, raw_label, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, duplicate_count, crop_path, top_candidates_json, status)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                detection_id,
+                screenshot_id,
+                slot_index,
+                entity_id,
+                raw_label,
+                1.0,
+                "run_detail_board",
+                0,
+                0,
+                0,
+                0,
+                1,
+                None,
+                payload,
+                "ok",
+            ),
+        )
+        duplicate_key = entity_id or f"title:{normalize_name(raw_label)}"
+        inserted_rows.append((detection_id, duplicate_key))
+
+    duplicate_counts = Counter(key for _detection_id, key in inserted_rows)
+    for detection_id, duplicate_key in inserted_rows:
+        conn.execute(
+            "UPDATE extracted_board_items SET duplicate_count = ? WHERE detection_id = ?",
+            (duplicate_counts[duplicate_key], detection_id),
+        )
+    return len(inserted_rows)
+
+
+def _insert_exact_skill_cards(conn, screenshot_id: int, cards: list[dict], lookup: dict[str, dict[str, str]]) -> int:
+    inserted = 0
+    ordered_cards = sorted(enumerate(cards), key=lambda item: (int(item[1].get("slot_position") or item[0]), item[0]))
+    for index, card in ordered_cards:
+        slot_index = int(card.get("slot_position") or index)
+        source_title = card.get("title")
+        entity_id, resolved_name = _resolve_reference_card(source_title, lookup)
+        raw_label = resolved_name or source_title or card.get("base_id") or f"skill_{slot_index}"
+        payload = json.dumps(
+            [
+                {
+                    "source": "run_detail_skill",
+                    "base_id": card.get("base_id"),
+                    "title": source_title,
+                    "resolved_entity_id": entity_id,
+                    "resolved_name": resolved_name,
+                    "slot_position": slot_index,
+                    "tier": card.get("tier"),
+                }
+            ],
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        conn.execute(
+            """
+            INSERT INTO extracted_skills(detection_id, screenshot_id, slot_index, entity_id, raw_label, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, crop_path, top_candidates_json, status)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                next_id(conn, "extracted_skills", "detection_id"),
+                screenshot_id,
+                slot_index,
+                entity_id,
+                raw_label,
+                1.0,
+                "run_detail_skill",
+                0,
+                0,
+                0,
+                0,
+                None,
+                payload,
+                "ok",
+            ),
+        )
+        inserted += 1
+    return inserted
 
 
 def _queue_review(conn, screenshot_id: int, detection_type: str, crop_path: str, confidence: float, raw_label: str | None, top_candidates_json: str) -> None:
@@ -71,7 +212,7 @@ def _queue_review(conn, screenshot_id: int, detection_type: str, crop_path: str,
 def _build_rank_reference_samples(screenshots) -> list:
     rank_samples = []
     for screenshot in screenshots:
-        rank_tier = screenshot["rank_title_hint"]
+        rank_tier = screenshot["player_rank_tier"] or screenshot["rank_tier"]
         image_path = screenshot["local_path"]
         if not rank_tier or not image_path:
             continue
@@ -145,24 +286,18 @@ def _match_item_slot(image: Image.Image, box: CropBox, item_features, item_hints
 
 def extract_board_data(conn, settings: Settings) -> dict[str, int]:
     item_features, skill_features = _load_reference_sets(conn)
-    conn.execute(
-        "DELETE FROM extracted_board_items WHERE screenshot_id IN (SELECT screenshot_id FROM screenshots WHERE is_primary = 1)"
-    )
-    conn.execute(
-        "DELETE FROM extracted_skills WHERE screenshot_id IN (SELECT screenshot_id FROM screenshots WHERE is_primary = 1)"
-    )
-    conn.execute(
-        "DELETE FROM extracted_ranks WHERE screenshot_id IN (SELECT screenshot_id FROM screenshots WHERE is_primary = 1)"
-    )
-    conn.execute(
-        "DELETE FROM review_queue WHERE screenshot_id IN (SELECT screenshot_id FROM screenshots WHERE is_primary = 1)"
-    )
+    item_lookup = _load_reference_lookup(conn, "reference_items")
+    skill_lookup = _load_reference_lookup(conn, "reference_skills")
+    conn.execute("DELETE FROM extracted_board_items")
+    conn.execute("DELETE FROM extracted_skills")
+    conn.execute("DELETE FROM extracted_ranks")
+    conn.execute("DELETE FROM review_queue")
     screenshots = conn.execute(
         """
-        SELECT s.*, p.title, p.rank_title_hint, p.item_hints_json, p.post_url
+        SELECT s.*, r.title, r.rank_tier, r.run_outcome_tier, r.player_rank_tier, r.card_hints_json, r.board_cards_json, r.skill_cards_json, r.run_url
         FROM screenshots s
-        JOIN posts p ON p.post_id = s.post_id
-        WHERE s.local_path IS NOT NULL AND s.is_primary = 0
+        JOIN runs r ON r.run_id = s.run_id
+        WHERE s.is_primary = 1
         ORDER BY s.screenshot_id
         """
     ).fetchall()
@@ -182,11 +317,29 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
                 f"[extract] screenshot {index}/{len(screenshots)} id={screenshot_id} items={item_detections} skills={skill_detections} ranks={rank_detections}",
                 flush=True,
             )
-        image_path = Path(screenshot["local_path"])
-        if not image_path.exists():
+        image_path = Path(screenshot["local_path"]) if screenshot["local_path"] else None
+        card_hints = json.loads(screenshot["card_hints_json"])
+        exact_board_cards = _parse_embedded_cards(screenshot["board_cards_json"])
+        exact_skill_cards = _parse_embedded_cards(screenshot["skill_cards_json"])
+        matched_item_features = _hint_matched_features(item_features, card_hints)
+        matched_skill_features = _hint_matched_features(skill_features, card_hints)
+        item_confidence_threshold = 0.30 if matched_item_features is not item_features else 0.38
+        skill_confidence_threshold = 0.28 if matched_skill_features is not skill_features else 0.33
+
+        conn.execute("DELETE FROM extracted_board_items WHERE screenshot_id = ?", (screenshot_id,))
+        conn.execute("DELETE FROM extracted_skills WHERE screenshot_id = ?", (screenshot_id,))
+        conn.execute("DELETE FROM extracted_ranks WHERE screenshot_id = ?", (screenshot_id,))
+        conn.execute("DELETE FROM review_queue WHERE screenshot_id = ?", (screenshot_id,))
+
+        if exact_board_cards:
+            item_detections += _insert_exact_board_cards(conn, screenshot_id, exact_board_cards, item_lookup)
+        if exact_skill_cards:
+            skill_detections += _insert_exact_skill_cards(conn, screenshot_id, exact_skill_cards, skill_lookup)
+
+        if image_path is None or not image_path.exists():
+            processed += 1
             continue
         if (screenshot["width"] or 0) < 1000 or (screenshot["height"] or 0) < 600:
-            conn.execute("DELETE FROM review_queue WHERE screenshot_id = ?", (screenshot_id,))
             _queue_review(
                 conn,
                 screenshot_id,
@@ -199,7 +352,7 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
                         "width": screenshot["width"],
                         "height": screenshot["height"],
                         "local_path": str(image_path),
-                        "post_url": screenshot["post_url"],
+                        "run_url": screenshot["run_url"],
                     },
                     ensure_ascii=True,
                     sort_keys=True,
@@ -207,14 +360,6 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
             )
             processed += 1
             continue
-        item_hints = json.loads(screenshot["item_hints_json"])
-        matched_item_features = _hint_matched_item_features(item_features, item_hints)
-        item_confidence_threshold = 0.30 if matched_item_features is not item_features else 0.38
-
-        conn.execute("DELETE FROM extracted_board_items WHERE screenshot_id = ?", (screenshot_id,))
-        conn.execute("DELETE FROM extracted_skills WHERE screenshot_id = ?", (screenshot_id,))
-        conn.execute("DELETE FROM extracted_ranks WHERE screenshot_id = ?", (screenshot_id,))
-        conn.execute("DELETE FROM review_queue WHERE screenshot_id = ?", (screenshot_id,))
 
         try:
             with Image.open(image_path) as raw_image:
@@ -231,7 +376,7 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
                     {
                         "error": str(exc),
                         "local_path": str(image_path),
-                        "post_url": screenshot["post_url"],
+                        "run_url": screenshot["run_url"],
                     },
                     ensure_ascii=True,
                     sort_keys=True,
@@ -247,126 +392,129 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
             save_crop(image, regions["skills"], settings.debug_skill_dir / f"skills_{screenshot_id}.png")
             save_crop(image, regions["rank"], settings.debug_rank_dir / f"rank_{screenshot_id}.png")
 
-            board_boxes = fallback_grid(regions["board"])
-            skill_boxes = fallback_skill_grid(regions["skills"])
             annotations: list[tuple[CropBox, str, str]] = []
 
-            predicted_items: list[str] = []
-            for slot_index, box in enumerate(board_boxes):
-                candidates, variant_results = _match_item_slot(image, box, matched_item_features, item_hints)
-                top_candidate = candidates[0] if candidates else None
-                focus_box = top_candidate["box"] if top_candidate else inset_box(box, 0.14, 0.08, 0.86, 0.78)
-                crop = image.crop((focus_box.x, focus_box.y, focus_box.x + focus_box.w, focus_box.y + focus_box.h))
-                crop_path = settings.debug_crops_dir / f"item_{screenshot_id}_{slot_index}.png"
-                crop.save(crop_path)
-                confidence = top_candidate["confidence"] if top_candidate else 0.0
-                entity_id = top_candidate["entity_id"] if top_candidate and confidence >= item_confidence_threshold else None
-                raw_label = top_candidate["name"] if top_candidate else None
-                status = "ok" if entity_id else "review"
-                payload = json.dumps(
-                    [
-                        {
-                            "entity_id": candidate["entity_id"],
-                            "name": candidate["name"],
-                            "confidence": candidate["confidence"],
-                            "detail": candidate["detail"],
-                        }
-                        for candidate in candidates
-                    ]
-                    + [
-                        {
-                            "variant": variant_name,
-                            "crop_box": {"x": variant_box.x, "y": variant_box.y, "w": variant_box.w, "h": variant_box.h},
-                            "top_candidates": json.loads(candidate_payload(variant_candidates)),
-                        }
-                        for variant_name, variant_box, variant_candidates in variant_results
-                    ],
-                    ensure_ascii=True,
-                    sort_keys=True,
-                )
-                conn.execute(
-                    """
-                    INSERT INTO extracted_board_items(detection_id, screenshot_id, slot_index, entity_id, raw_label, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, duplicate_count, crop_path, top_candidates_json, status)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        next_id(conn, "extracted_board_items", "detection_id"),
-                        screenshot_id,
-                        slot_index,
-                        entity_id,
-                        raw_label,
-                        confidence,
-                        "icon_match+slot_detection",
-                        focus_box.x,
-                        focus_box.y,
-                        focus_box.w,
-                        focus_box.h,
-                        None,
-                        str(crop_path),
-                        payload,
-                        status,
-                    ),
-                )
-                annotations.append((focus_box, raw_label or "unknown", "lime" if entity_id else "orange"))
-                if entity_id:
-                    predicted_items.append(entity_id)
-                    item_detections += 1
-                else:
-                    _queue_review(conn, screenshot_id, "board_item", str(crop_path), confidence, raw_label, payload)
+            if not exact_board_cards:
+                board_boxes = fallback_grid(regions["board"])
+                predicted_items: list[str] = []
+                for slot_index, box in enumerate(board_boxes):
+                    candidates, variant_results = _match_item_slot(image, box, matched_item_features, card_hints)
+                    top_candidate = candidates[0] if candidates else None
+                    focus_box = top_candidate["box"] if top_candidate else inset_box(box, 0.14, 0.08, 0.86, 0.78)
+                    crop = image.crop((focus_box.x, focus_box.y, focus_box.x + focus_box.w, focus_box.y + focus_box.h))
+                    crop_path = settings.debug_crops_dir / f"item_{screenshot_id}_{slot_index}.png"
+                    crop.save(crop_path)
+                    confidence = top_candidate["confidence"] if top_candidate else 0.0
+                    entity_id = top_candidate["entity_id"] if top_candidate and confidence >= item_confidence_threshold else None
+                    raw_label = top_candidate["name"] if top_candidate else None
+                    status = "ok" if entity_id else "review"
+                    payload = json.dumps(
+                        [
+                            {
+                                "entity_id": candidate["entity_id"],
+                                "name": candidate["name"],
+                                "confidence": candidate["confidence"],
+                                "detail": candidate["detail"],
+                            }
+                            for candidate in candidates
+                        ]
+                        + [
+                            {
+                                "variant": variant_name,
+                                "crop_box": {"x": variant_box.x, "y": variant_box.y, "w": variant_box.w, "h": variant_box.h},
+                                "top_candidates": json.loads(candidate_payload(variant_candidates)),
+                            }
+                            for variant_name, variant_box, variant_candidates in variant_results
+                        ],
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO extracted_board_items(detection_id, screenshot_id, slot_index, entity_id, raw_label, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, duplicate_count, crop_path, top_candidates_json, status)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            next_id(conn, "extracted_board_items", "detection_id"),
+                            screenshot_id,
+                            slot_index,
+                            entity_id,
+                            raw_label,
+                            confidence,
+                            "icon_match+slot_detection",
+                            focus_box.x,
+                            focus_box.y,
+                            focus_box.w,
+                            focus_box.h,
+                            None,
+                            str(crop_path),
+                            payload,
+                            status,
+                        ),
+                    )
+                    annotations.append((focus_box, raw_label or "unknown", "lime" if entity_id else "orange"))
+                    if entity_id:
+                        predicted_items.append(entity_id)
+                        item_detections += 1
+                    else:
+                        _queue_review(conn, screenshot_id, "board_item", str(crop_path), confidence, raw_label, payload)
 
-            counts = Counter(predicted_items)
-            for entity_id, duplicate_count in counts.items():
-                conn.execute(
-                    "UPDATE extracted_board_items SET duplicate_count = ? WHERE screenshot_id = ? AND entity_id = ?",
-                    (duplicate_count, screenshot_id, entity_id),
-                )
+                counts = Counter(predicted_items)
+                for entity_id, duplicate_count in counts.items():
+                    conn.execute(
+                        "UPDATE extracted_board_items SET duplicate_count = ? WHERE screenshot_id = ? AND entity_id = ?",
+                        (duplicate_count, screenshot_id, entity_id),
+                    )
 
-            for slot_index, box in enumerate(skill_boxes):
-                crop = image.crop((box.x, box.y, box.x + box.w, box.y + box.h))
-                crop_path = settings.debug_crops_dir / f"skill_{screenshot_id}_{slot_index}.png"
-                crop.save(crop_path)
-                candidates = match_crop(crop, skill_features)
-                top_candidate = candidates[0] if candidates else None
-                confidence = top_candidate.confidence if top_candidate else 0.0
-                entity_id = top_candidate.entity_id if top_candidate and confidence >= 0.33 else None
-                raw_label = top_candidate.name if top_candidate else None
-                status = "ok" if entity_id else "review"
-                payload = candidate_payload(candidates)
-                conn.execute(
-                    """
-                    INSERT INTO extracted_skills(detection_id, screenshot_id, slot_index, entity_id, raw_label, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, crop_path, top_candidates_json, status)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        next_id(conn, "extracted_skills", "detection_id"),
-                        screenshot_id,
-                        slot_index,
-                        entity_id,
-                        raw_label,
-                        confidence,
-                        "icon_match+fixed_skill_grid",
-                        box.x,
-                        box.y,
-                        box.w,
-                        box.h,
-                        str(crop_path),
-                        payload,
-                        status,
-                    ),
-                )
-                if entity_id:
-                    annotations.append((box, raw_label or "skill", "cyan"))
-                    skill_detections += 1
-                elif confidence >= 0.20:
-                    annotations.append((box, raw_label or "skill?", "yellow"))
-                    _queue_review(conn, screenshot_id, "skill", str(crop_path), confidence, raw_label, payload)
+            if not exact_skill_cards:
+                skill_boxes = fallback_skill_grid(regions["skills"])
+                for slot_index, box in enumerate(skill_boxes):
+                    crop = image.crop((box.x, box.y, box.x + box.w, box.y + box.h))
+                    crop_path = settings.debug_crops_dir / f"skill_{screenshot_id}_{slot_index}.png"
+                    crop.save(crop_path)
+                    candidates = match_crop(crop, matched_skill_features, name_hints=card_hints)
+                    top_candidate = candidates[0] if candidates else None
+                    confidence = top_candidate.confidence if top_candidate else 0.0
+                    entity_id = top_candidate.entity_id if top_candidate and confidence >= skill_confidence_threshold else None
+                    raw_label = top_candidate.name if top_candidate else None
+                    status = "ok" if entity_id else "review"
+                    payload = candidate_payload(candidates)
+                    conn.execute(
+                        """
+                        INSERT INTO extracted_skills(detection_id, screenshot_id, slot_index, entity_id, raw_label, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, crop_path, top_candidates_json, status)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            next_id(conn, "extracted_skills", "detection_id"),
+                            screenshot_id,
+                            slot_index,
+                            entity_id,
+                            raw_label,
+                            confidence,
+                            "icon_match+fixed_skill_grid",
+                            box.x,
+                            box.y,
+                            box.w,
+                            box.h,
+                            str(crop_path),
+                            payload,
+                            status,
+                        ),
+                    )
+                    if entity_id:
+                        annotations.append((box, raw_label or "skill", "cyan"))
+                        skill_detections += 1
+                    elif confidence >= 0.20:
+                        annotations.append((box, raw_label or "skill?", "yellow"))
+                        _queue_review(conn, screenshot_id, "skill", str(crop_path), confidence, raw_label, payload)
 
             rank_box = regions["rank"]
             rank_candidates = []
             rank_variant_results = []
+            hinted_rank = screenshot["player_rank_tier"] or screenshot["rank_tier"]
             for variant_name, badge_box in rank_badge_variants(rank_box):
                 badge_crop = image.crop((badge_box.x, badge_box.y, badge_box.x + badge_box.w, badge_box.y + badge_box.h))
-                candidates = match_rank_crop(badge_crop, rank_samples, title_hint=screenshot["rank_title_hint"])
+                candidates = match_rank_crop(badge_crop, rank_samples, title_hint=hinted_rank)
                 rank_variant_results.append((variant_name, badge_box, candidates))
                 for candidate in candidates:
                     rank_candidates.append((variant_name, badge_box, candidate))
@@ -408,7 +556,6 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
             rank_focus_box = top_rank["box"] if top_rank else rank_badge_variants(rank_box)[0][1]
             rank_crop_path = settings.debug_crops_dir / f"rank_{screenshot_id}.png"
             image.crop((rank_focus_box.x, rank_focus_box.y, rank_focus_box.x + rank_focus_box.w, rank_focus_box.y + rank_focus_box.h)).save(rank_crop_path)
-            hinted_rank = screenshot["rank_title_hint"]
             rank_label = top_rank["rank_tier"] if top_rank and top_rank["confidence"] >= 0.42 else hinted_rank
             rank_confidence = top_rank["confidence"] if top_rank else (0.30 if hinted_rank else 0.05)
             rank_status = "ok" if rank_label else "review"
@@ -432,7 +579,8 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
                     for variant_name, badge_box, candidates in rank_variant_results
                 ]
                 + [
-                    {"source": "title_hint", "rank": hinted_rank, "confidence": 0.30 if hinted_rank else 0.0},
+                    {"source": "player_rank_hint", "rank": screenshot["player_rank_tier"], "confidence": 0.30 if screenshot["player_rank_tier"] else 0.0},
+                    {"source": "run_outcome_bootstrap", "rank": screenshot["rank_tier"], "outcome": screenshot["run_outcome_tier"], "confidence": 0.20 if screenshot["rank_tier"] else 0.0},
                     {"source": "screenshot_crop_saved", "path": str(rank_crop_path)},
                     {"source": "rank_reference_samples", "count": len(rank_samples)},
                 ],
@@ -449,7 +597,7 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
                     rank_label,
                     rank_label,
                     rank_confidence,
-                    "rank_badge_classifier+title_hint_fallback",
+                    "rank_badge_classifier+bootstrap_hint",
                     rank_focus_box.x,
                     rank_focus_box.y,
                     rank_focus_box.w,
@@ -460,6 +608,7 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
                 ),
             )
             if rank_label:
+                conn.execute("UPDATE runs SET player_rank_tier = ? WHERE run_id = ?", (rank_label, screenshot["run_id"]))
                 annotations.append((rank_focus_box, rank_label, "magenta"))
                 rank_detections += 1
             else:

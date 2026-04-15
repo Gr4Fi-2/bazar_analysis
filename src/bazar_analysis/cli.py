@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import typer
 
-from .analysis import summarize
-from .config import ensure_directories, get_settings
-from .crawler import crawl_posts
+from .analysis import summarize, systemic_analysis
+from .config import ensure_directories, get_settings, reset_workspace_data
+from .crawler import crawl_runs
 from .db import init_db
 from .downloader import download_screenshots
 from .exporter import export_datasets
@@ -22,10 +22,18 @@ def _bootstrap():
     return settings, conn
 
 
-@app.command("crawl-posts")
-def crawl_posts_cmd() -> None:
+@app.command("reset-data")
+def reset_data_cmd() -> None:
+    settings = get_settings()
+    reset_workspace_data(settings)
+    ensure_directories(settings)
+    typer.echo({"reset": "ok"})
+
+
+@app.command("crawl-runs")
+def crawl_runs_cmd() -> None:
     settings, conn = _bootstrap()
-    result = crawl_posts(conn, settings)
+    result = crawl_runs(conn, settings)
     typer.echo(result)
 
 
@@ -64,15 +72,23 @@ def summarize_cmd() -> None:
     typer.echo(result)
 
 
+@app.command("systemic-analysis")
+def systemic_analysis_cmd() -> None:
+    settings, conn = _bootstrap()
+    result = systemic_analysis(conn, settings)
+    typer.echo(result)
+
+
 @app.command("run-all")
 def run_all() -> None:
     settings, conn = _bootstrap()
-    typer.echo({"crawl_posts": crawl_posts(conn, settings)})
+    typer.echo({"crawl_runs": crawl_runs(conn, settings)})
     typer.echo({"build_reference": build_reference_catalog(conn, settings)})
     typer.echo({"download_screenshots": download_screenshots(conn, settings)})
     typer.echo({"extract_board_data": extract_board_data(conn, settings)})
     typer.echo({"export_datasets": export_datasets(conn, settings)})
     typer.echo({"summarize": summarize(conn, settings)})
+    typer.echo({"systemic_analysis": systemic_analysis(conn, settings)})
 
 
 if __name__ == "__main__":

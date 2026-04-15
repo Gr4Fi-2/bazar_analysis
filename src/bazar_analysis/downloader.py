@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import os
 from pathlib import Path
+import time
 
 import httpx
+from curl_cffi import requests as curl_requests
 from PIL import Image
 
 from .config import Settings
@@ -26,9 +29,20 @@ def _sha256_file(path: Path) -> str:
 
 def _download_and_validate_image(client: httpx.Client, url: str, output_path: Path, attempts: int = 3) -> tuple[bytes, int, int]:
     last_error: Exception | None = None
+    delay_seconds = max(0.0, float(os.environ.get("BAZAR_DOWNLOAD_DELAY_SECONDS", "0.20")))
     for attempt in range(1, attempts + 1):
         try:
-            response = client.get(url)
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+            response = curl_requests.get(
+                url,
+                impersonate="firefox",
+                timeout=60,
+                headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer": "https://bazaardb.gg/run",
+                },
+            )
             response.raise_for_status()
             content = response.content
             output_path.write_bytes(content)
@@ -38,13 +52,15 @@ def _download_and_validate_image(client: httpx.Client, url: str, output_path: Pa
             last_error = exc
             output_path.unlink(missing_ok=True)
             print(f"[download] retry {attempt}/{attempts} failed for {url}: {type(exc).__name__}", flush=True)
+            if attempt < attempts:
+                time.sleep(max(0.75, delay_seconds or 0.0) * attempt)
     raise RuntimeError(f"failed to download valid image after {attempts} attempts: {url}") from last_error
 
 
 def download_screenshots(conn, settings: Settings) -> dict[str, int]:
     rows = conn.execute(
         """
-        SELECT screenshot_id, screenshot_url, post_id, local_path, sha256
+        SELECT screenshot_id, screenshot_url, run_id, local_path, sha256
         FROM screenshots
         ORDER BY screenshot_id
         """
@@ -58,7 +74,7 @@ def download_screenshots(conn, settings: Settings) -> dict[str, int]:
     with httpx.Client(
         headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0 Safari/537.36",
-            "Referer": "https://bazaar-builds.net/",
+            "Referer": "https://bazaardb.gg/run",
         },
         follow_redirects=True,
         timeout=60.0,

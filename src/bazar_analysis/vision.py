@@ -231,7 +231,7 @@ def _candidate_score(crop_image: Image.Image, crop_array: np.ndarray, reference:
     orb_score = orb_similarity(descriptors, reference.orb_descriptors)
     hint_score = 0.0
     if name_hint:
-        hint_score = fuzz.partial_ratio(normalize_name(name_hint), reference.normalized_name) / 100.0
+        hint_score = fuzz.ratio(normalize_name(name_hint), reference.normalized_name) / 100.0
 
     score = max(0.0, 1.0 - (phash_distance / 20.0)) * 0.30
     score += max(0.0, 1.0 - color_distance) * 0.10
@@ -278,7 +278,7 @@ def match_crop(crop_image: Image.Image, references: list[ReferenceFeature], name
     crop_array = np.array(crop_image.convert("RGB"))
     candidates: list[MatchCandidate] = []
     for reference in references:
-        hint = max(hints, key=lambda item: fuzz.partial_ratio(normalize_name(item), reference.normalized_name), default=None)
+        hint = max(hints, key=lambda item: fuzz.ratio(normalize_name(item), reference.normalized_name), default=None)
         candidates.append(_candidate_score(crop_image, crop_array, reference, name_hint=hint))
     candidates.sort(key=lambda item: item.confidence, reverse=True)
     return candidates[:top_n]
