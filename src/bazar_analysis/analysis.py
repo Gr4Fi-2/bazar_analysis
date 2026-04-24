@@ -57,6 +57,7 @@ def _pipeline_coverage_summary(conn) -> pl.DataFrame:
                 SUM(CASE WHEN detection_type = 'board_item' THEN 1 ELSE 0 END) AS review_board_items,
                 SUM(CASE WHEN detection_type = 'skill' THEN 1 ELSE 0 END) AS review_skills,
                 SUM(CASE WHEN detection_type = 'rank' THEN 1 ELSE 0 END) AS review_ranks,
+                SUM(CASE WHEN detection_type = 'prestige_state' THEN 1 ELSE 0 END) AS review_prestige_state,
                 SUM(CASE WHEN detection_type = 'screenshot_layout' THEN 1 ELSE 0 END) AS review_layout,
                 SUM(CASE WHEN detection_type = 'screenshot_file' THEN 1 ELSE 0 END) AS review_files
             FROM review_queue
@@ -89,6 +90,7 @@ def _pipeline_coverage_summary(conn) -> pl.DataFrame:
             COALESCE(rv.review_board_items, 0) AS review_board_items,
             COALESCE(rv.review_skills, 0) AS review_skills,
             COALESCE(rv.review_ranks, 0) AS review_ranks,
+            COALESCE(rv.review_prestige_state, 0) AS review_prestige_state,
             COALESCE(rv.review_layout, 0) AS review_layout,
             COALESCE(rv.review_files, 0) AS review_files
         FROM screenshots s

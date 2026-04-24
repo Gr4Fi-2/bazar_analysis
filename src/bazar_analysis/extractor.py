@@ -44,6 +44,7 @@ RANK_PROTOTYPES = {
     "Diamond": np.array([0.193, 74.0 / 180.0, 89.3 / 255.0, 155.1 / 255.0, 0.236, 0.194, 0.234, 0.429], dtype=np.float32),
     "Legendary": np.array([0.590, 56.0 / 180.0, 178.2 / 255.0, 177.8 / 255.0, 0.758, 0.348, 0.105, 0.108], dtype=np.float32),
 }
+RANK_CROWN_REVIEW_TYPES = ("rank", "prestige_state")
 
 
 def _load_reference_sets(conn):
@@ -94,11 +95,21 @@ def _resolve_reference_card(card_title: str | None, lookup: dict[str, dict[str, 
     return resolved["entity_id"], resolved["name"]
 
 
+def _card_slot_position(card: dict, fallback_index: int) -> int:
+    slot_position = card.get("slot_position")
+    if slot_position is None or slot_position == "":
+        return fallback_index
+    try:
+        return int(slot_position)
+    except (TypeError, ValueError):
+        return fallback_index
+
+
 def _insert_exact_board_cards(conn, screenshot_id: int, cards: list[dict], lookup: dict[str, dict[str, str]]) -> int:
     inserted_rows: list[tuple[int, str]] = []
-    ordered_cards = sorted(enumerate(cards), key=lambda item: (int(item[1].get("slot_position") or item[0]), item[0]))
+    ordered_cards = sorted(enumerate(cards), key=lambda item: (_card_slot_position(item[1], item[0]), item[0]))
     for index, card in ordered_cards:
-        slot_index = int(card.get("slot_position") or index)
+        slot_index = _card_slot_position(card, index)
         source_title = card.get("title")
         entity_id, resolved_name = _resolve_reference_card(source_title, lookup)
         raw_label = resolved_name or source_title or card.get("base_id") or f"board_{slot_index}"
@@ -156,9 +167,9 @@ def _insert_exact_board_cards(conn, screenshot_id: int, cards: list[dict], looku
 
 def _insert_exact_skill_cards(conn, screenshot_id: int, cards: list[dict], lookup: dict[str, dict[str, str]]) -> int:
     inserted = 0
-    ordered_cards = sorted(enumerate(cards), key=lambda item: (int(item[1].get("slot_position") or item[0]), item[0]))
+    ordered_cards = sorted(enumerate(cards), key=lambda item: (_card_slot_position(item[1], item[0]), item[0]))
     for index, card in ordered_cards:
-        slot_index = int(card.get("slot_position") or index)
+        slot_index = _card_slot_position(card, index)
         source_title = card.get("title")
         entity_id, resolved_name = _resolve_reference_card(source_title, lookup)
         raw_label = resolved_name or source_title or card.get("base_id") or f"skill_{slot_index}"
@@ -225,11 +236,6 @@ def _queue_review(conn, screenshot_id: int, detection_type: str, crop_path: str,
         """,
         (next_id(conn, "review_queue", "review_id"), screenshot_id, detection_type, crop_path, confidence, raw_label, top_candidates_json),
     )
-
-
-def _bootstrap_rank_tier(player_rank_tier: str | None, run_victory_tier: str | None) -> str | None:
-    _ = run_victory_tier
-    return normalize_player_rank_tier(player_rank_tier)
 
 
 def _crop_relative_region(image: Image.Image, region: tuple[float, float, float, float]) -> Image.Image:
@@ -338,8 +344,7 @@ def _gray_ratio(rgb_array: np.ndarray) -> float:
     return float(np.mean(gray_mask))
 
 
-def _detect_broken_crown(image: Image.Image, prestige: int | None) -> tuple[int | None, Image.Image, dict[str, object]]:
-    _ = prestige
+def _detect_broken_crown(image: Image.Image) -> tuple[int | None, Image.Image, dict[str, object]]:
     badge_crop, _badge_box, badge_presence = _extract_rank_badge_crop(image)
     state_region = FULL_UI_CROWN_REGION if badge_crop is not None else CROPPED_UI_CROWN_REGION
     state_crop = _crop_relative_region(image, state_region)
@@ -461,6 +466,17 @@ def _detect_and_store_rank(conn, settings: Settings, screenshot_id: int, run_id:
     return rank_label, rank_confidence, badge_box
 
 
+def _clear_rank_crown_reviews(conn, screenshot_id: int | None = None) -> None:
+    placeholders = ", ".join("?" for _ in RANK_CROWN_REVIEW_TYPES)
+    if screenshot_id is None:
+        conn.execute(f"DELETE FROM review_queue WHERE detection_type IN ({placeholders})", RANK_CROWN_REVIEW_TYPES)
+        return
+    conn.execute(
+        f"DELETE FROM review_queue WHERE screenshot_id = ? AND detection_type IN ({placeholders})",
+        (screenshot_id, *RANK_CROWN_REVIEW_TYPES),
+    )
+
+
 def extract_board_data(conn, settings: Settings) -> dict[str, int]:
     item_features, skill_features = _load_reference_sets(conn)
     item_lookup = _load_reference_lookup(conn, "reference_items")
@@ -564,7 +580,7 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
         try:
             width, height = image.size
             regions = default_regions(width, height)
-            broken_crown_flag, broken_crown_crop, broken_crown_details = _detect_broken_crown(image, screenshot["prestige"])
+            broken_crown_flag, broken_crown_crop, broken_crown_details = _detect_broken_crown(image)
             broken_crown_crop_path = settings.debug_crops_dir / f"prestige_{screenshot_id}.png"
             broken_crown_crop.save(broken_crown_crop_path)
             if broken_crown_flag is None:
@@ -730,8 +746,8 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
 
 def extract_rank_and_crown(conn, settings: Settings) -> dict[str, int]:
     conn.execute("DELETE FROM extracted_ranks")
-    conn.execute("DELETE FROM review_queue")
-    conn.execute("UPDATE runs SET player_rank_tier = NULL, player_rank_label = NULL, has_broken_crown = NULL")
+    _clear_rank_crown_reviews(conn)
+    conn.execute("UPDATE runs SET has_broken_crown = NULL")
     screenshots = conn.execute(
         """
         SELECT s.*, r.player_rank_tier, r.run_victory_tier, r.prestige, r.run_url
@@ -758,7 +774,7 @@ def extract_rank_and_crown(conn, settings: Settings) -> dict[str, int]:
 
         image_path = Path(screenshot["local_path"]) if screenshot["local_path"] else None
         conn.execute("DELETE FROM extracted_ranks WHERE screenshot_id = ?", (screenshot_id,))
-        conn.execute("DELETE FROM review_queue WHERE screenshot_id = ?", (screenshot_id,))
+        _clear_rank_crown_reviews(conn, screenshot_id)
 
         if image_path is None or not image_path.exists() or (screenshot["width"] or 0) < 1000 or (screenshot["height"] or 0) < 600:
             processed += 1
@@ -772,7 +788,7 @@ def extract_rank_and_crown(conn, settings: Settings) -> dict[str, int]:
             continue
 
         try:
-            broken_crown_flag, broken_crown_crop, broken_crown_details = _detect_broken_crown(image, screenshot["prestige"])
+            broken_crown_flag, broken_crown_crop, broken_crown_details = _detect_broken_crown(image)
             broken_crown_crop_path = settings.debug_crops_dir / f"prestige_{screenshot_id}.png"
             broken_crown_crop.save(broken_crown_crop_path)
             if broken_crown_flag is None:
