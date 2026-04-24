@@ -4,16 +4,16 @@ import json
 from collections import Counter
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import Image
 
 from .config import Settings
 from .db import next_id
-from .utils import normalize_name
+from .utils import normalize_name, normalize_player_rank_tier
 from .vision import (
     CropBox,
     annotate_image,
-    build_rank_feature_sample,
     candidate_payload,
     default_regions,
     fallback_grid,
@@ -21,11 +21,29 @@ from .vision import (
     inset_box,
     item_crop_variants,
     load_reference_features,
-    match_rank_crop,
     match_crop,
     rank_badge_variants,
     save_crop,
 )
+
+
+FULL_UI_CROWN_REGION = (0.50, 0.77, 0.54, 0.86)
+CROPPED_UI_CROWN_REGION = (0.33, 0.82, 0.41, 0.96)
+INTACT_CROWN_ORANGE_RATIO_THRESHOLD = 0.07
+BROKEN_CROWN_GRAY_RATIO_THRESHOLD = 0.018
+BROKEN_CROWN_ORANGE_RATIO_MAX = 0.06
+BROKEN_CROWN_REVIEW_MARGIN = 0.02
+BADGE_PRESENCE_THRESHOLD = 0.15
+RANK_DISTANCE_THRESHOLD = 0.42
+RANK_MARGIN_THRESHOLD = 0.08
+RANK_PROTOTYPE_WEIGHTS = np.array([1.0, 1.4, 1.0, 0.8, 1.7, 1.5, 2.1, 1.2], dtype=np.float32)
+RANK_PROTOTYPES = {
+    "Bronze": np.array([0.491, 23.3 / 180.0, 120.9 / 255.0, 139.0 / 255.0, 0.809, 0.210, 0.061, 0.136], dtype=np.float32),
+    "Silver": np.array([0.484, 54.0 / 180.0, 67.2 / 255.0, 136.2 / 255.0, 0.418, 0.155, 0.071, 0.359], dtype=np.float32),
+    "Gold": np.array([0.490, 41.7 / 180.0, 128.8 / 255.0, 141.0 / 255.0, 0.347, 0.462, 0.058, 0.162], dtype=np.float32),
+    "Diamond": np.array([0.193, 74.0 / 180.0, 89.3 / 255.0, 155.1 / 255.0, 0.236, 0.194, 0.234, 0.429], dtype=np.float32),
+    "Legendary": np.array([0.590, 56.0 / 180.0, 178.2 / 255.0, 177.8 / 255.0, 0.758, 0.348, 0.105, 0.108], dtype=np.float32),
+}
 
 
 def _load_reference_sets(conn):
@@ -209,26 +227,136 @@ def _queue_review(conn, screenshot_id: int, detection_type: str, crop_path: str,
     )
 
 
-def _build_rank_reference_samples(screenshots) -> list:
-    rank_samples = []
-    for screenshot in screenshots:
-        rank_tier = screenshot["player_rank_tier"] or screenshot["rank_tier"]
-        image_path = screenshot["local_path"]
-        if not rank_tier or not image_path:
-            continue
-        path = Path(image_path)
-        if not path.exists():
-            continue
-        try:
-            with Image.open(path) as raw_image:
-                image = raw_image.convert("RGB")
-                rank_box = default_regions(*image.size)["rank"]
-                for _variant_name, badge_box in rank_badge_variants(rank_box):
-                    crop = image.crop((badge_box.x, badge_box.y, badge_box.x + badge_box.w, badge_box.y + badge_box.h))
-                    rank_samples.append(build_rank_feature_sample(rank_tier, crop))
-        except Exception:
-            continue
-    return rank_samples
+def _bootstrap_rank_tier(player_rank_tier: str | None, run_victory_tier: str | None) -> str | None:
+    _ = run_victory_tier
+    return normalize_player_rank_tier(player_rank_tier)
+
+
+def _crop_relative_region(image: Image.Image, region: tuple[float, float, float, float]) -> Image.Image:
+    width, height = image.size
+    left = int(width * region[0])
+    top = int(height * region[1])
+    right = int(width * region[2])
+    bottom = int(height * region[3])
+    return image.crop((left, top, right, bottom))
+
+
+def _badge_presence_mask(rgb_array: np.ndarray) -> np.ndarray:
+    hsv_array = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2HSV)
+    sky_mask = (hsv_array[:, :, 0] > 85) & (hsv_array[:, :, 0] < 125) & (hsv_array[:, :, 1] > 20) & (hsv_array[:, :, 2] > 80)
+    return ~sky_mask
+
+
+def _badge_presence_ratio(rgb_array: np.ndarray) -> float:
+    if rgb_array.size == 0:
+        return 0.0
+    return float(np.mean(_badge_presence_mask(rgb_array)))
+
+
+def _extract_rank_badge_crop(image: Image.Image) -> tuple[Image.Image | None, CropBox | None, float]:
+    rank_box = default_regions(*image.size)["rank"]
+    badge_box = rank_badge_variants(rank_box)[0][1]
+    badge_crop = image.crop((badge_box.x, badge_box.y, badge_box.x + badge_box.w, badge_box.y + badge_box.h))
+    badge_array = np.array(badge_crop.convert("RGB"))
+    presence_ratio = _badge_presence_ratio(badge_array)
+    if presence_ratio < BADGE_PRESENCE_THRESHOLD:
+        return None, None, presence_ratio
+    return badge_crop, badge_box, presence_ratio
+
+
+def _rank_feature_vector(crop_image: Image.Image) -> np.ndarray:
+    crop_array = np.array(crop_image.convert("RGB"))
+    if crop_array.size == 0:
+        return np.zeros(8, dtype=np.float32)
+    hsv_array = cv2.cvtColor(crop_array, cv2.COLOR_RGB2HSV)
+    present_mask = _badge_presence_mask(crop_array)
+    pixels = crop_array[present_mask]
+    if pixels.size == 0:
+        return np.zeros(8, dtype=np.float32)
+    hue = hsv_array[:, :, 0][present_mask]
+    saturation = hsv_array[:, :, 1][present_mask]
+    value = hsv_array[:, :, 2][present_mask]
+    return np.array(
+        [
+            float(np.mean(present_mask)),
+            float(np.mean(hue) / 180.0),
+            float(np.mean(saturation) / 255.0),
+            float(np.mean(value) / 255.0),
+            float(np.mean((pixels[:, 0] > pixels[:, 1] + 25) & (pixels[:, 0] > pixels[:, 2] + 25))),
+            float(np.mean((pixels[:, 0] > 120) & (pixels[:, 1] > 90) & (pixels[:, 2] < 140))),
+            float(np.mean((pixels[:, 2] > pixels[:, 0] + 20) & (pixels[:, 2] > pixels[:, 1] + 5))),
+            float(np.mean((saturation < 60) & (value > 110))),
+        ],
+        dtype=np.float32,
+    )
+
+
+def _classify_rank_badge(badge_crop: Image.Image) -> tuple[str | None, float, dict[str, object]]:
+    features = _rank_feature_vector(badge_crop)
+    candidates: list[dict[str, object]] = []
+    for tier, prototype in RANK_PROTOTYPES.items():
+        distance = float(np.sqrt(np.sum(((features - prototype) * RANK_PROTOTYPE_WEIGHTS) ** 2)))
+        candidates.append({"tier": tier, "distance": round(distance, 4)})
+    candidates.sort(key=lambda item: float(item["distance"]))
+    best = candidates[0] if candidates else None
+    second = candidates[1] if len(candidates) > 1 else None
+    if best is None:
+        return None, 0.0, {"candidates": candidates, "features": [round(float(value), 4) for value in features.tolist()]}
+
+    best_distance = float(best["distance"])
+    second_distance = float(second["distance"]) if second is not None else 1.0
+    margin = second_distance - best_distance
+    confidence = round(min(0.999, max(0.0, 1.0 - best_distance / 0.70) + min(0.20, margin)), 4)
+    details = {
+        "candidates": candidates,
+        "features": [round(float(value), 4) for value in features.tolist()],
+        "margin": round(float(margin), 4),
+    }
+    if best_distance > RANK_DISTANCE_THRESHOLD or margin < RANK_MARGIN_THRESHOLD:
+        return None, confidence, details
+    return str(best["tier"]), confidence, details
+
+
+def _orange_ratio(rgb_array: np.ndarray) -> float:
+    if rgb_array.size == 0:
+        return 0.0
+    hsv_array = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2HSV)
+    hue = hsv_array[:, :, 0]
+    saturation = hsv_array[:, :, 1]
+    value = hsv_array[:, :, 2]
+    orange_mask = (hue >= 8) & (hue <= 30) & (saturation >= 80) & (value >= 90)
+    return float(np.mean(orange_mask))
+
+
+def _gray_ratio(rgb_array: np.ndarray) -> float:
+    if rgb_array.size == 0:
+        return 0.0
+    hsv_array = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2HSV)
+    saturation = hsv_array[:, :, 1]
+    value = hsv_array[:, :, 2]
+    gray_mask = (saturation <= 70) & (value >= 110)
+    return float(np.mean(gray_mask))
+
+
+def _detect_broken_crown(image: Image.Image, prestige: int | None) -> tuple[int | None, Image.Image, dict[str, object]]:
+    _ = prestige
+    badge_crop, _badge_box, badge_presence = _extract_rank_badge_crop(image)
+    state_region = FULL_UI_CROWN_REGION if badge_crop is not None else CROPPED_UI_CROWN_REGION
+    state_crop = _crop_relative_region(image, state_region)
+    state_array = np.array(state_crop.convert("RGB"))
+    orange_ratio = _orange_ratio(state_array)
+    gray_ratio = _gray_ratio(state_array)
+    details = {
+        "badge_presence": round(float(badge_presence), 4),
+        "orange_ratio": round(float(orange_ratio), 4),
+        "gray_ratio": round(float(gray_ratio), 4),
+        "layout": "full_ui" if badge_crop is not None else "cropped_ui",
+    }
+    if orange_ratio >= INTACT_CROWN_ORANGE_RATIO_THRESHOLD and orange_ratio > gray_ratio + BROKEN_CROWN_REVIEW_MARGIN:
+        return 0, state_crop, details
+    if gray_ratio >= BROKEN_CROWN_GRAY_RATIO_THRESHOLD and orange_ratio <= BROKEN_CROWN_ORANGE_RATIO_MAX:
+        return 1, state_crop, details
+    return None, state_crop, details
 
 
 def _match_item_slot(image: Image.Image, box: CropBox, item_features, item_hints: list[str]):
@@ -284,6 +412,55 @@ def _match_item_slot(image: Image.Image, box: CropBox, item_features, item_hints
     return merged_candidates[:5], variant_results
 
 
+def _detect_and_store_rank(conn, settings: Settings, screenshot_id: int, run_id: int, image: Image.Image) -> tuple[str | None, float, CropBox | None]:
+    badge_crop, badge_box, presence_ratio = _extract_rank_badge_crop(image)
+    if badge_crop is None or badge_box is None:
+        return None, 0.0, None
+
+    rank_crop_path = settings.debug_crops_dir / f"rank_{screenshot_id}.png"
+    badge_crop.save(rank_crop_path)
+    rank_label, rank_confidence, rank_details = _classify_rank_badge(badge_crop)
+    rank_payload = json.dumps(
+        {
+            "badge_presence": round(float(presence_ratio), 4),
+            "classifier": rank_details,
+            "crop_path": str(rank_crop_path),
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+    rank_status = "ok" if rank_label else "review"
+    conn.execute(
+        """
+        INSERT INTO extracted_ranks(screenshot_id, raw_label, rank_tier, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, crop_path, top_candidates_json, status)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            screenshot_id,
+            rank_label,
+            rank_label,
+            rank_confidence,
+            "badge_prototype_classifier",
+            badge_box.x,
+            badge_box.y,
+            badge_box.w,
+            badge_box.h,
+            str(rank_crop_path),
+            rank_payload,
+            rank_status,
+        ),
+    )
+    if rank_label:
+        normalized_rank_label = normalize_player_rank_tier(rank_label) or rank_label
+        conn.execute(
+            "UPDATE runs SET player_rank_tier = ?, player_rank_label = ? WHERE run_id = ?",
+            (normalized_rank_label, normalized_rank_label, run_id),
+        )
+    else:
+        _queue_review(conn, screenshot_id, "rank", str(rank_crop_path), rank_confidence, None, rank_payload)
+    return rank_label, rank_confidence, badge_box
+
+
 def extract_board_data(conn, settings: Settings) -> dict[str, int]:
     item_features, skill_features = _load_reference_sets(conn)
     item_lookup = _load_reference_lookup(conn, "reference_items")
@@ -294,7 +471,7 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
     conn.execute("DELETE FROM review_queue")
     screenshots = conn.execute(
         """
-        SELECT s.*, r.title, r.rank_tier, r.run_outcome_tier, r.player_rank_tier, r.card_hints_json, r.board_cards_json, r.skill_cards_json, r.run_url
+        SELECT s.*, r.title, r.run_victory_tier, r.player_rank_tier, r.prestige, r.card_hints_json, r.board_cards_json, r.skill_cards_json, r.run_url
         FROM screenshots s
         JOIN runs r ON r.run_id = s.run_id
         WHERE s.is_primary = 1
@@ -302,8 +479,7 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
         """
     ).fetchall()
     print(f"[extract] processing {len(screenshots)} board screenshots", flush=True)
-    rank_samples = _build_rank_reference_samples(screenshots)
-    print(f"[extract] built {len(rank_samples)} rank samples", flush=True)
+    print("[extract] using source-first item and skill enrichment", flush=True)
 
     processed = 0
     item_detections = 0
@@ -388,6 +564,27 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
         try:
             width, height = image.size
             regions = default_regions(width, height)
+            broken_crown_flag, broken_crown_crop, broken_crown_details = _detect_broken_crown(image, screenshot["prestige"])
+            broken_crown_crop_path = settings.debug_crops_dir / f"prestige_{screenshot_id}.png"
+            broken_crown_crop.save(broken_crown_crop_path)
+            if broken_crown_flag is None:
+                _queue_review(
+                    conn,
+                    screenshot_id,
+                    "prestige_state",
+                    str(broken_crown_crop_path),
+                    max(float(broken_crown_details.get("orange_ratio", 0.0)), float(broken_crown_details.get("gray_ratio", 0.0))),
+                    "broken_crown_unclear",
+                    json.dumps(
+                        {**broken_crown_details, "prestige": screenshot["prestige"]},
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                )
+            conn.execute(
+                "UPDATE runs SET has_broken_crown = ? WHERE run_id = ?",
+                (broken_crown_flag, screenshot["run_id"]),
+            )
             save_crop(image, regions["board"], settings.debug_board_dir / f"board_{screenshot_id}.png")
             save_crop(image, regions["skills"], settings.debug_skill_dir / f"skills_{screenshot_id}.png")
             save_crop(image, regions["rank"], settings.debug_rank_dir / f"rank_{screenshot_id}.png")
@@ -508,111 +705,10 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
                         annotations.append((box, raw_label or "skill?", "yellow"))
                         _queue_review(conn, screenshot_id, "skill", str(crop_path), confidence, raw_label, payload)
 
-            rank_box = regions["rank"]
-            rank_candidates = []
-            rank_variant_results = []
-            hinted_rank = screenshot["player_rank_tier"] or screenshot["rank_tier"]
-            for variant_name, badge_box in rank_badge_variants(rank_box):
-                badge_crop = image.crop((badge_box.x, badge_box.y, badge_box.x + badge_box.w, badge_box.y + badge_box.h))
-                candidates = match_rank_crop(badge_crop, rank_samples, title_hint=hinted_rank)
-                rank_variant_results.append((variant_name, badge_box, candidates))
-                for candidate in candidates:
-                    rank_candidates.append((variant_name, badge_box, candidate))
-
-            aggregated_ranks: dict[str, dict] = {}
-            for variant_name, badge_box, candidate in rank_candidates:
-                current = aggregated_ranks.get(candidate.entity_id)
-                if current is None:
-                    aggregated_ranks[candidate.entity_id] = {
-                        "scores": [candidate.confidence],
-                        "detail": [dict(candidate.detail, variant=variant_name)],
-                        "box": badge_box,
-                        "best_score": candidate.confidence,
-                    }
-                    continue
-                current["scores"].append(candidate.confidence)
-                current["detail"].append(dict(candidate.detail, variant=variant_name))
-                if candidate.confidence > current["best_score"]:
-                    current["best_score"] = candidate.confidence
-                    current["box"] = badge_box
-
-            merged_rank_candidates = []
-            for rank_tier, payload in aggregated_ranks.items():
-                scores = sorted(payload["scores"], reverse=True)
-                best_score = scores[0]
-                avg_score = sum(scores) / len(scores)
-                agreement_bonus = min(0.06, 0.03 * (len(scores) - 1))
-                merged_rank_candidates.append(
-                    {
-                        "rank_tier": rank_tier,
-                        "confidence": round(min(0.999, best_score * 0.82 + avg_score * 0.12 + agreement_bonus), 4),
-                        "detail": payload["detail"],
-                        "box": payload["box"],
-                    }
-                )
-            merged_rank_candidates.sort(key=lambda item: item["confidence"], reverse=True)
-
-            top_rank = merged_rank_candidates[0] if merged_rank_candidates else None
-            rank_focus_box = top_rank["box"] if top_rank else rank_badge_variants(rank_box)[0][1]
-            rank_crop_path = settings.debug_crops_dir / f"rank_{screenshot_id}.png"
-            image.crop((rank_focus_box.x, rank_focus_box.y, rank_focus_box.x + rank_focus_box.w, rank_focus_box.y + rank_focus_box.h)).save(rank_crop_path)
-            rank_label = top_rank["rank_tier"] if top_rank and top_rank["confidence"] >= 0.42 else hinted_rank
-            rank_confidence = top_rank["confidence"] if top_rank else (0.30 if hinted_rank else 0.05)
-            rank_status = "ok" if rank_label else "review"
-            rank_payload = json.dumps(
-                [
-                    {
-                        "source": "image_classifier",
-                        "rank": candidate["rank_tier"],
-                        "confidence": candidate["confidence"],
-                        "detail": candidate["detail"],
-                    }
-                    for candidate in merged_rank_candidates[:5]
-                ]
-                + [
-                    {
-                        "source": "variant_candidates",
-                        "variant": variant_name,
-                        "crop_box": {"x": badge_box.x, "y": badge_box.y, "w": badge_box.w, "h": badge_box.h},
-                        "top_candidates": json.loads(candidate_payload(candidates)),
-                    }
-                    for variant_name, badge_box, candidates in rank_variant_results
-                ]
-                + [
-                    {"source": "player_rank_hint", "rank": screenshot["player_rank_tier"], "confidence": 0.30 if screenshot["player_rank_tier"] else 0.0},
-                    {"source": "run_outcome_bootstrap", "rank": screenshot["rank_tier"], "outcome": screenshot["run_outcome_tier"], "confidence": 0.20 if screenshot["rank_tier"] else 0.0},
-                    {"source": "screenshot_crop_saved", "path": str(rank_crop_path)},
-                    {"source": "rank_reference_samples", "count": len(rank_samples)},
-                ],
-                ensure_ascii=True,
-                sort_keys=True,
-            )
-            conn.execute(
-                """
-                INSERT INTO extracted_ranks(screenshot_id, raw_label, rank_tier, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, crop_path, top_candidates_json, status)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    screenshot_id,
-                    rank_label,
-                    rank_label,
-                    rank_confidence,
-                    "rank_badge_classifier+bootstrap_hint",
-                    rank_focus_box.x,
-                    rank_focus_box.y,
-                    rank_focus_box.w,
-                    rank_focus_box.h,
-                    str(rank_crop_path),
-                    rank_payload,
-                    rank_status,
-                ),
-            )
-            if rank_label:
-                conn.execute("UPDATE runs SET player_rank_tier = ? WHERE run_id = ?", (rank_label, screenshot["run_id"]))
+            rank_label, _rank_confidence, rank_focus_box = _detect_and_store_rank(conn, settings, screenshot_id, screenshot["run_id"], image)
+            if rank_label and rank_focus_box is not None:
                 annotations.append((rank_focus_box, rank_label, "magenta"))
                 rank_detections += 1
-            else:
-                _queue_review(conn, screenshot_id, "rank", str(rank_crop_path), rank_confidence, None, rank_payload)
 
             annotate_image(image, annotations, settings.debug_annotated_dir / f"annotated_{screenshot_id}.png")
         finally:
@@ -630,3 +726,87 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
         "skill_detections": skill_detections,
         "rank_detections": rank_detections,
     }
+
+
+def extract_rank_and_crown(conn, settings: Settings) -> dict[str, int]:
+    conn.execute("DELETE FROM extracted_ranks")
+    conn.execute("DELETE FROM review_queue")
+    conn.execute("UPDATE runs SET player_rank_tier = NULL, player_rank_label = NULL, has_broken_crown = NULL")
+    screenshots = conn.execute(
+        """
+        SELECT s.*, r.player_rank_tier, r.run_victory_tier, r.prestige, r.run_url
+        FROM screenshots s
+        JOIN runs r ON r.run_id = s.run_id
+        WHERE s.is_primary = 1
+        ORDER BY s.screenshot_id
+        """
+    ).fetchall()
+    print(f"[rank-crown] processing {len(screenshots)} primary screenshots", flush=True)
+    print("[rank-crown] using badge prototype rank classifier", flush=True)
+
+    processed = 0
+    rank_detections = 0
+    crown_updates = 0
+
+    for index, screenshot in enumerate(screenshots, start=1):
+        screenshot_id = screenshot["screenshot_id"]
+        if index == 1 or index % 25 == 0 or index == len(screenshots):
+            print(
+                f"[rank-crown] screenshot {index}/{len(screenshots)} id={screenshot_id} crowns={crown_updates} ranks={rank_detections}",
+                flush=True,
+            )
+
+        image_path = Path(screenshot["local_path"]) if screenshot["local_path"] else None
+        conn.execute("DELETE FROM extracted_ranks WHERE screenshot_id = ?", (screenshot_id,))
+        conn.execute("DELETE FROM review_queue WHERE screenshot_id = ?", (screenshot_id,))
+
+        if image_path is None or not image_path.exists() or (screenshot["width"] or 0) < 1000 or (screenshot["height"] or 0) < 600:
+            processed += 1
+            continue
+
+        try:
+            with Image.open(image_path) as raw_image:
+                image = raw_image.convert("RGB")
+        except Exception:
+            processed += 1
+            continue
+
+        try:
+            broken_crown_flag, broken_crown_crop, broken_crown_details = _detect_broken_crown(image, screenshot["prestige"])
+            broken_crown_crop_path = settings.debug_crops_dir / f"prestige_{screenshot_id}.png"
+            broken_crown_crop.save(broken_crown_crop_path)
+            if broken_crown_flag is None:
+                _queue_review(
+                    conn,
+                    screenshot_id,
+                    "prestige_state",
+                    str(broken_crown_crop_path),
+                    max(float(broken_crown_details.get("orange_ratio", 0.0)), float(broken_crown_details.get("gray_ratio", 0.0))),
+                    "broken_crown_unclear",
+                    json.dumps(
+                        {**broken_crown_details, "prestige": screenshot["prestige"]},
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                )
+            conn.execute(
+                "UPDATE runs SET has_broken_crown = ? WHERE run_id = ?",
+                (broken_crown_flag, screenshot["run_id"]),
+            )
+            if broken_crown_flag is not None:
+                crown_updates += 1
+
+            rank_label, _rank_confidence, _rank_focus_box = _detect_and_store_rank(conn, settings, screenshot_id, screenshot["run_id"], image)
+            if rank_label:
+                rank_detections += 1
+        finally:
+            image.close()
+
+        processed += 1
+
+    conn.commit()
+    print(
+        f"[rank-crown] done: screenshots={processed}, crowns={crown_updates}, ranks={rank_detections}",
+        flush=True,
+    )
+    return {"screenshots": processed, "crown_updates": crown_updates, "rank_detections": rank_detections}

@@ -125,7 +125,10 @@ def download_screenshots(conn, settings: Settings) -> dict[str, int]:
                     )
                     continue
 
-            sha256 = hashlib.sha256(content).hexdigest() if content is not None else (row["sha256"] or _sha256_file(output_path))
+            final_path = output_path if content is not None else existing_path
+            if final_path is None:
+                continue
+            sha256 = hashlib.sha256(content).hexdigest() if content is not None else (row["sha256"] or _sha256_file(final_path))
 
             conn.execute(
                 """
@@ -134,7 +137,7 @@ def download_screenshots(conn, settings: Settings) -> dict[str, int]:
                 WHERE screenshot_id = ?
                 """,
                 (
-                    str(output_path),
+                    str(final_path),
                     sha256,
                     width,
                     height,

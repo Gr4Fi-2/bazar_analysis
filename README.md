@@ -79,7 +79,9 @@ uv run bazar-analysis crawl-runs
 - `data/debug/`: board/rank/skill crops and annotated screenshots
 - `data/exports/`: normalized parquet/csv datasets and summary tables
 - `data/db/bazar_analysis.duckdb`: DuckDB working database
-- `runs.csv` now includes `run_wins_label`, `run_outcome_tier`, `player_rank_tier`, `board_cards_json`, and `skill_cards_json`
+- `runs.csv` now includes `run_wins_label`, `run_victory_tier`, `run_victory_label`, `player_rank_tier`, `player_rank_label`, `has_broken_crown`, `max_health`, `prestige`, `level`, `income`, `gold`, `board_cards_json`, and `skill_cards_json`
+- `summary_exact_item_triplets.csv` provides BazaarDB-style exact 3-item board cores with board count, wins, and gold/perfect/broken-crown rates
+- `summary_skill_shell_affinity.csv` and `summary_item_shell_affinity.csv` show where skills and items are broadly good versus shell-locked
 
 ## Reliability Notes
 
@@ -88,7 +90,7 @@ uv run bazar-analysis crawl-runs
 - Reference catalog building is browser-free by default. The normal path uses `curl_cffi` browser impersonation plus BazaarDB sitemap/list pages, caches the fetched HTML locally, and downloads icon files incrementally.
 - Set `BAZAR_ALLOW_PLAYWRIGHT_FALLBACK=1` only if you want Playwright as a last resort and have installed the optional `browser` extra. By default the pipeline will not open a browser.
 - Board and skill extraction prefer exact run-detail card lists from BazaarDB and only fall back to image heuristics when the embedded card payload is missing.
-- Rank extraction is still heuristic: it saves the top-left crop, tries template-style matching, and currently uses stored run tiers only as a bootstrap hint when no better player-rank label is available.
+- Rank extraction is still heuristic: it saves the top-left crop, tries template-style matching, and currently uses stored victory tiers only as a weak bootstrap hint when no better player-rank label is available.
 - Low-confidence detections are written to `review_queue` with saved crop files and top candidates instead of being silently accepted.
 
 ## Current Heuristics

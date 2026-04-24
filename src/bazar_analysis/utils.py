@@ -8,6 +8,15 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 
+RUN_VICTORY_LABELS = {
+    "Perfect": "Perfect Victory",
+    "Gold": "Gold Victory",
+    "Silver": "Silver Victory",
+    "Bronze": "Bronze Victory",
+    "Unfortunate": "An Unfortunate Journey",
+}
+
+
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -19,6 +28,34 @@ def slugify(value: str) -> str:
 
 def normalize_name(value: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", value.lower())).strip()
+
+
+def normalize_player_rank_tier(value: str | None) -> str | None:
+    if not value:
+        return None
+    lowered = normalize_name(value)
+    if "legend" in lowered:
+        return "Legendary"
+    for tier in ["diamond", "gold", "silver", "bronze"]:
+        if tier in lowered:
+            return tier.title()
+    return None
+
+
+def derive_run_victory(record_wins: int | None, prestige: int | None) -> tuple[str | None, str | None]:
+    if record_wins is None:
+        return None, None
+    if record_wins >= 10 and (prestige or 0) >= 20:
+        tier = "Perfect"
+    elif record_wins >= 10:
+        tier = "Gold"
+    elif record_wins >= 7:
+        tier = "Silver"
+    elif record_wins >= 4:
+        tier = "Bronze"
+    else:
+        tier = "Unfortunate"
+    return tier, RUN_VICTORY_LABELS[tier]
 
 
 def canonical_image_url(url: str) -> str:
@@ -48,4 +85,3 @@ def parse_score_from_title(title: str) -> tuple[int | None, int | None]:
             return 10, 0
         return None, None
     return int(match.group(1)), int(match.group(2))
-

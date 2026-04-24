@@ -3,3 +3,7 @@ data/
 .idea/
 __pycache__/
 *.pyc
+*.db
+*.duckdb
+*.duckdb.wal
+*.sqlite

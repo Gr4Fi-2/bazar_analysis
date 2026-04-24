@@ -15,7 +15,14 @@ from curl_cffi import requests as curl_requests
 
 from .config import Settings
 from .db import next_id
-from .utils import absolute_url, canonical_image_url, json_dumps, safe_stem_from_url
+from .utils import (
+    absolute_url,
+    canonical_image_url,
+    derive_run_victory,
+    json_dumps,
+    normalize_player_rank_tier,
+    safe_stem_from_url,
+)
 
 
 RUNS_URL = "https://bazaardb.gg/run"
@@ -25,7 +32,7 @@ RANK_ORDER = {
     "Silver": 2,
     "Gold": 3,
     "Diamond": 4,
-    "Legend": 5,
+    "Legendary": 5,
 }
 
 
@@ -61,8 +68,7 @@ def _load_run_filters() -> RunFilters:
         for hero in os.environ.get("BAZAR_RUN_HEROES", "Jules").split(",")
         if hero.strip()
     }
-    min_rank_raw = os.environ.get("BAZAR_RUN_MIN_RANK", "").strip().title()
-    min_rank = min_rank_raw if min_rank_raw in RANK_ORDER else None
+    min_rank = normalize_player_rank_tier(os.environ.get("BAZAR_RUN_MIN_RANK", "").strip())
     date_range = os.environ.get("BAZAR_RUN_DATE_RANGE", "latest_season").strip().lower()
     pages_raw = os.environ.get("BAZAR_RUN_DISCOVERY_PAGES", "0").strip().lower()
     pages = None if pages_raw in {"", "0", "all"} else max(1, int(pages_raw))
@@ -102,6 +108,23 @@ def _created_bounds_for_date_range(date_range: str) -> tuple[str | None, str | N
     return (None, None)
 
 
+def _parse_created_timestamp(value: str | None) -> dt.datetime | None:
+    if not value:
+        return None
+    normalized = value.strip()
+    try:
+        parsed = dt.datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.UTC)
+        return parsed.astimezone(dt.UTC)
+    except ValueError:
+        pass
+    try:
+        return dt.datetime.strptime(normalized, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=dt.UTC)
+    except ValueError:
+        return None
+
+
 def _rank_meets_minimum(rank_tier: str | None, min_rank: str | None) -> bool:
     if min_rank is None:
         return True
@@ -135,34 +158,6 @@ def _parse_int(value: str | None) -> int | None:
         return None
     digits = re.sub(r"[^0-9]", "", value)
     return int(digits) if digits else None
-
-
-def _parse_rank_tier(outcome_text: str | None) -> str | None:
-    if not outcome_text:
-        return None
-    lowered = outcome_text.lower()
-    if "perfect" in lowered:
-        return "Gold"
-    for tier in ["legend", "diamond", "gold", "silver", "bronze"]:
-        if tier in lowered:
-            return tier.title()
-    return None
-
-
-def _parse_run_outcome_tier(outcome_text: str | None) -> str | None:
-    if not outcome_text:
-        return None
-    lowered = outcome_text.lower()
-    if "perfect" in lowered:
-        return "Perfect"
-    if "unfortunate" in lowered:
-        return "Unfortunate"
-    if "legendary" in lowered:
-        return "Legendary"
-    for tier in ["legend", "diamond", "gold", "silver", "bronze"]:
-        if tier in lowered:
-            return tier.title()
-    return None
 
 
 def _sort_value(run_payload: dict, sort: str) -> int | None:
@@ -318,7 +313,7 @@ def _extract_player_rank_tier(run_payload: dict | None) -> str | None:
     if not isinstance(run_payload, dict):
         return None
     for key in ["playerRank", "playerRankTier", "profileRank", "profileRankTier", "rankTier", "rank"]:
-        parsed = _parse_rank_tier(str(run_payload.get(key) or ""))
+        parsed = normalize_player_rank_tier(str(run_payload.get(key) or ""))
         if parsed:
             return parsed
     for container_key in ["profile", "player", "user"]:
@@ -326,7 +321,7 @@ def _extract_player_rank_tier(run_payload: dict | None) -> str | None:
         if not isinstance(container, dict):
             continue
         for key in ["rank", "rankTier", "profileRank", "profileRankTier"]:
-            parsed = _parse_rank_tier(str(container.get(key) or ""))
+            parsed = normalize_player_rank_tier(str(container.get(key) or ""))
             if parsed:
                 return parsed
     return None
@@ -337,6 +332,8 @@ def discover_runs(client: httpx.Client, settings: Settings, filters: RunFilters)
     seen_ids: set[str] = set()
     cursor_payload = None
     exhausted = True
+    created_after_cutoff = _parse_created_timestamp(filters.created_after)
+    created_before_cutoff = _parse_created_timestamp(filters.created_before)
 
     if filters.date_range == "latest_season":
         print("[crawl] using BazaarDB API feed for latest season", flush=True)
@@ -357,7 +354,26 @@ def discover_runs(client: httpx.Client, settings: Settings, filters: RunFilters)
             break
         save_text(settings.raw_runs_dir / f"run_api_page_{page_number}.json", json.dumps(page_payload, ensure_ascii=True, sort_keys=True))
         page_runs = 0
+        reached_created_after_cutoff = False
         for payload in page_payload:
+            payload_created_at = _parse_created_timestamp(str(payload.get("createdAt") or ""))
+            if (
+                created_before_cutoff is not None
+                and payload_created_at is not None
+                and filters.sort == "newest"
+                and filters.order == "desc"
+                and payload_created_at > created_before_cutoff
+            ):
+                continue
+            if (
+                created_after_cutoff is not None
+                and payload_created_at is not None
+                and filters.sort == "newest"
+                and filters.order == "desc"
+                and payload_created_at <= created_after_cutoff
+            ):
+                reached_created_after_cutoff = True
+                break
             source_run_id = str(payload["id"])
             if source_run_id in seen_ids:
                 continue
@@ -371,6 +387,9 @@ def discover_runs(client: httpx.Client, settings: Settings, filters: RunFilters)
             )
             page_runs += 1
         print(f"[crawl] api page {page_number}: discovered {page_runs} runs, total {len(runs)}", flush=True)
+        if reached_created_after_cutoff:
+            print("[crawl] reached created-after cutoff; stopping discovery", flush=True)
+            break
         if len(page_payload) < 20:
             break
         cursor_payload = page_payload[-1]
@@ -408,9 +427,14 @@ def parse_run(client: httpx.Client, settings: Settings, run: RunRecord, delay_se
     record_losses = int(losses_raw) if losses_raw is not None else (int(losses_token) if losses_token and losses_token.isdigit() else None)
     outcome_text = outcome_match.group(3).strip() if outcome_match else None
     max_health = int(payload.get("statMaxHealth")) if payload.get("statMaxHealth") is not None else (_parse_int(outcome_match.group(4)) if outcome_match else None)
-    rank_tier = _parse_rank_tier(outcome_text)
-    run_outcome_tier = _parse_run_outcome_tier(outcome_text)
+    prestige = int(payload.get("statPrestige")) if payload.get("statPrestige") is not None else None
+    level = int(payload.get("statLevel")) if payload.get("statLevel") is not None else None
+    income = int(payload.get("statIncome")) if payload.get("statIncome") is not None else None
+    gold = int(payload.get("statGold")) if payload.get("statGold") is not None else None
+    run_victory_tier, run_victory_label = derive_run_victory(record_wins, prestige)
     player_rank_tier = _extract_player_rank_tier(hydrated_run)
+    player_rank_label = player_rank_tier
+    has_broken_crown = None
 
     board_cards = _normalize_embedded_cards(hydrated_run.get("board") or payload.get("items"), "run_page_board")
     skill_cards = _normalize_embedded_cards(hydrated_run.get("skills") or payload.get("skills"), "run_page_skill")
@@ -430,7 +454,7 @@ def parse_run(client: httpx.Client, settings: Settings, run: RunRecord, delay_se
                 card_hints.append(name)
 
     wins_label = f"{record_wins} Wins" if record_wins is not None else "Unknown Record"
-    title = _collapse_whitespace(" ".join(part for part in [hero, wins_label, outcome_text] if part))
+    title = _collapse_whitespace(" ".join(part for part in [hero, wins_label, run_victory_label or outcome_text] if part))
 
     return {
         "source_run_id": run.source_run_id,
@@ -443,15 +467,17 @@ def parse_run(client: httpx.Client, settings: Settings, run: RunRecord, delay_se
         "outcome_text": outcome_text,
         "record_wins": record_wins,
         "record_losses": record_losses,
-        "rank_tier": rank_tier,
-        "run_outcome_tier": run_outcome_tier,
         "run_wins_label": wins_label,
+        "run_victory_tier": run_victory_tier,
+        "run_victory_label": run_victory_label,
         "player_rank_tier": player_rank_tier,
+        "player_rank_label": player_rank_label,
+        "has_broken_crown": has_broken_crown,
         "max_health": max_health,
-        "prestige": int(payload.get("statPrestige")) if payload.get("statPrestige") is not None else None,
-        "level": int(payload.get("statLevel")) if payload.get("statLevel") is not None else None,
-        "income": int(payload.get("statIncome")) if payload.get("statIncome") is not None else None,
-        "gold": int(payload.get("statGold")) if payload.get("statGold") is not None else None,
+        "prestige": prestige,
+        "level": level,
+        "income": income,
+        "gold": gold,
         "html_path": str(html_path),
         "card_hints": card_hints,
         "board_cards": board_cards,
@@ -497,6 +523,16 @@ def _delete_stale_runs(conn, active_run_ids: set[int]) -> tuple[int, int]:
     return len(stale_run_ids), removed_screenshots
 
 
+def _is_full_discovery_scope(filters: RunFilters) -> bool:
+    default_after, default_before = _created_bounds_for_date_range(filters.date_range)
+    return (
+        filters.date_range in {"latest_season", "season13"}
+        and filters.pages is None
+        and filters.created_after == default_after
+        and filters.created_before == default_before
+    )
+
+
 def crawl_runs(conn, settings: Settings) -> dict[str, int]:
     now = dt.datetime.utcnow().isoformat(timespec="seconds")
     filters = _load_run_filters()
@@ -525,7 +561,7 @@ def crawl_runs(conn, settings: Settings) -> dict[str, int]:
             if filters.heroes and record["hero"] not in filters.heroes:
                 skipped_filters += 1
                 continue
-            if not _rank_meets_minimum(record["rank_tier"], filters.min_rank):
+            if not _rank_meets_minimum(record["player_rank_tier"], filters.min_rank):
                 skipped_filters += 1
                 continue
             if existing_run:
@@ -533,8 +569,8 @@ def crawl_runs(conn, settings: Settings) -> dict[str, int]:
                 conn.execute(
                     """
                     UPDATE runs
-                    SET hero = ?, run_url = ?, created_at = ?, title = ?, profile_name = ?, profile_url = ?, outcome_text = ?, record_wins = ?, record_losses = ?, rank_tier = ?,
-                        run_outcome_tier = ?, run_wins_label = ?, player_rank_tier = COALESCE(?, player_rank_tier), max_health = ?, prestige = ?, level = ?, income = ?, gold = ?, html_path = ?,
+                    SET hero = ?, run_url = ?, created_at = ?, title = ?, profile_name = ?, profile_url = ?, outcome_text = ?, record_wins = ?, record_losses = ?,
+                        run_wins_label = ?, run_victory_tier = ?, run_victory_label = ?, player_rank_tier = COALESCE(?, player_rank_tier), player_rank_label = COALESCE(?, player_rank_label), has_broken_crown = ?, max_health = ?, prestige = ?, level = ?, income = ?, gold = ?, html_path = ?,
                         card_hints_json = ?, board_cards_json = ?, skill_cards_json = ?, crawled_at = ?
                     WHERE run_id = ?
                     """,
@@ -548,10 +584,12 @@ def crawl_runs(conn, settings: Settings) -> dict[str, int]:
                         record["outcome_text"],
                         record["record_wins"],
                         record["record_losses"],
-                        record["rank_tier"],
-                        record["run_outcome_tier"],
                         record["run_wins_label"],
+                        record["run_victory_tier"],
+                        record["run_victory_label"],
                         record["player_rank_tier"],
+                        record["player_rank_label"],
+                        record["has_broken_crown"],
                         record["max_health"],
                         record["prestige"],
                         record["level"],
@@ -569,10 +607,10 @@ def crawl_runs(conn, settings: Settings) -> dict[str, int]:
                 run_id = next_id(conn, "runs", "run_id")
                 conn.execute(
                     """
-                    INSERT INTO runs(run_id, source_run_id, hero, run_url, created_at, title, profile_name, profile_url, outcome_text, record_wins, record_losses, rank_tier,
-                                     run_outcome_tier, run_wins_label, player_rank_tier, max_health, prestige, level, income, gold, html_path, card_hints_json, board_cards_json,
-                                     skill_cards_json, crawled_at)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO runs(run_id, source_run_id, hero, run_url, created_at, title, profile_name, profile_url, outcome_text, record_wins, record_losses,
+                                     run_wins_label, run_victory_tier, run_victory_label, player_rank_tier, player_rank_label, has_broken_crown, max_health, prestige, level,
+                                     income, gold, html_path, card_hints_json, board_cards_json, skill_cards_json, crawled_at)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
@@ -586,10 +624,12 @@ def crawl_runs(conn, settings: Settings) -> dict[str, int]:
                         record["outcome_text"],
                         record["record_wins"],
                         record["record_losses"],
-                        record["rank_tier"],
-                        record["run_outcome_tier"],
                         record["run_wins_label"],
+                        record["run_victory_tier"],
+                        record["run_victory_label"],
                         record["player_rank_tier"],
+                        record["player_rank_label"],
+                        record["has_broken_crown"],
                         record["max_health"],
                         record["prestige"],
                         record["level"],
@@ -633,7 +673,7 @@ def crawl_runs(conn, settings: Settings) -> dict[str, int]:
                     )
                     inserted_screenshots += 1
 
-    if discovery.exhausted and run_failures == 0:
+    if discovery.exhausted and run_failures == 0 and _is_full_discovery_scope(filters):
         removed_runs, removed_screenshots = _delete_stale_runs(conn, active_run_ids)
     else:
         removed_runs = 0
@@ -643,6 +683,8 @@ def crawl_runs(conn, settings: Settings) -> dict[str, int]:
             reasons.append("discovery_incomplete")
         if run_failures:
             reasons.append(f"run_failures={run_failures}")
+        if not _is_full_discovery_scope(filters):
+            reasons.append("incremental_or_filtered_scope")
         print(f"[crawl] skipped stale-run prune ({', '.join(reasons)})", flush=True)
     conn.commit()
     print(

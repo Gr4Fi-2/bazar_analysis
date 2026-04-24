@@ -8,7 +8,7 @@ from .crawler import crawl_runs
 from .db import init_db
 from .downloader import download_screenshots
 from .exporter import export_datasets
-from .extractor import extract_board_data
+from .extractor import extract_board_data, extract_rank_and_crown
 from .reference import build_reference_catalog
 
 
@@ -55,6 +55,13 @@ def download_screenshots_cmd() -> None:
 def extract_board_data_cmd() -> None:
     settings, conn = _bootstrap()
     result = extract_board_data(conn, settings)
+    typer.echo(result)
+
+
+@app.command("extract-rank-crown")
+def extract_rank_crown_cmd() -> None:
+    settings, conn = _bootstrap()
+    result = extract_rank_and_crown(conn, settings)
     typer.echo(result)
 
 
