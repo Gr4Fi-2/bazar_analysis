@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import Counter
 from pathlib import Path
 
@@ -478,7 +479,12 @@ def _clear_rank_crown_reviews(conn, screenshot_id: int | None = None) -> None:
 
 
 def extract_board_data(conn, settings: Settings) -> dict[str, int]:
-    item_features, skill_features = _load_reference_sets(conn)
+    source_only = os.environ.get("BAZAR_EXTRACT_SOURCE_ONLY", "0") == "1"
+    if source_only:
+        item_features = []
+        skill_features = []
+    else:
+        item_features, skill_features = _load_reference_sets(conn)
     item_lookup = _load_reference_lookup(conn, "reference_items")
     skill_lookup = _load_reference_lookup(conn, "reference_skills")
     conn.execute("DELETE FROM extracted_board_items")
@@ -496,15 +502,18 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
     ).fetchall()
     print(f"[extract] processing {len(screenshots)} board screenshots", flush=True)
     print("[extract] using source-first item and skill enrichment", flush=True)
+    if source_only:
+        print("[extract] source-only mode enabled; skipping image fallback, rank, crown, and debug crops", flush=True)
 
     processed = 0
     item_detections = 0
     skill_detections = 0
     rank_detections = 0
+    progress_interval = 250 if source_only else 10
 
     for index, screenshot in enumerate(screenshots, start=1):
         screenshot_id = screenshot["screenshot_id"]
-        if index == 1 or index % 10 == 0 or index == len(screenshots):
+        if index == 1 or index % progress_interval == 0 or index == len(screenshots):
             print(
                 f"[extract] screenshot {index}/{len(screenshots)} id={screenshot_id} items={item_detections} skills={skill_detections} ranks={rank_detections}",
                 flush=True,
@@ -513,10 +522,11 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
         card_hints = json.loads(screenshot["card_hints_json"])
         exact_board_cards = _parse_embedded_cards(screenshot["board_cards_json"])
         exact_skill_cards = _parse_embedded_cards(screenshot["skill_cards_json"])
-        matched_item_features = _hint_matched_features(item_features, card_hints)
-        matched_skill_features = _hint_matched_features(skill_features, card_hints)
-        item_confidence_threshold = 0.30 if matched_item_features is not item_features else 0.38
-        skill_confidence_threshold = 0.28 if matched_skill_features is not skill_features else 0.33
+        if not source_only:
+            matched_item_features = _hint_matched_features(item_features, card_hints)
+            matched_skill_features = _hint_matched_features(skill_features, card_hints)
+            item_confidence_threshold = 0.30 if matched_item_features is not item_features else 0.38
+            skill_confidence_threshold = 0.28 if matched_skill_features is not skill_features else 0.33
 
         conn.execute("DELETE FROM extracted_board_items WHERE screenshot_id = ?", (screenshot_id,))
         conn.execute("DELETE FROM extracted_skills WHERE screenshot_id = ?", (screenshot_id,))
@@ -527,6 +537,10 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
             item_detections += _insert_exact_board_cards(conn, screenshot_id, exact_board_cards, item_lookup)
         if exact_skill_cards:
             skill_detections += _insert_exact_skill_cards(conn, screenshot_id, exact_skill_cards, skill_lookup)
+
+        if source_only:
+            processed += 1
+            continue
 
         if image_path is None or not image_path.exists():
             processed += 1

@@ -82,6 +82,9 @@ uv run bazar-analysis crawl-runs
 - `runs.csv` now includes `run_wins_label`, `run_victory_tier`, `run_victory_label`, `player_rank_tier`, `player_rank_label`, `has_broken_crown`, `max_health`, `prestige`, `level`, `income`, `gold`, `board_cards_json`, and `skill_cards_json`
 - `summary_exact_item_triplets.csv` provides BazaarDB-style exact 3-item board cores with board count, wins, and gold/perfect/broken-crown rates
 - `summary_skill_shell_affinity.csv` and `summary_item_shell_affinity.csv` show where skills and items are broadly good versus shell-locked
+- Simple frequency and co-occurrence summaries use duplicate-safe board presence, so repeated copies of the same item on one board do not inflate population-level rates
+- `summary_item_performance.csv` and `summary_skill_performance.csv` include duplicate-safe board presence, conservative weighted wins, and gold/perfect rates so low-sample entities do not dominate the top rows
+- `summary_core_builds.csv` only aggregates clusters with at least three boards, avoiding one-off full-board cores
 
 ## Reliability Notes
 

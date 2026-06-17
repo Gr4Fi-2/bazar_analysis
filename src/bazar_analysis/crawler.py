@@ -34,6 +34,11 @@ RANK_ORDER = {
     "Diamond": 4,
     "Legendary": 5,
 }
+SEASON_START_DATES = {
+    "season13": "Wed, 01 Apr 2026 16:12:11 GMT",
+    "season14": "Wed, 06 May 2026 16:24:57 GMT",
+    "season15": "Wed, 03 Jun 2026 16:56:45 GMT",
+}
 
 
 @dataclass
@@ -103,8 +108,14 @@ def _created_bounds_for_date_range(date_range: str) -> tuple[str | None, str | N
         return ((now - dt.timedelta(days=3)).strftime("%a, %d %b %Y %H:%M:%S GMT"), None)
     if date_range == "last7d":
         return ((now - dt.timedelta(days=7)).strftime("%a, %d %b %Y %H:%M:%S GMT"), None)
-    if date_range in {"latest_season", "season13"}:
-        return ("Wed, 01 Apr 2026 16:12:11 GMT", None)
+    if date_range == "latest_season":
+        return (SEASON_START_DATES["season15"], None)
+    if date_range == "season15":
+        return (SEASON_START_DATES["season15"], None)
+    if date_range == "season14":
+        return (SEASON_START_DATES["season14"], SEASON_START_DATES["season15"])
+    if date_range == "season13":
+        return (SEASON_START_DATES["season13"], SEASON_START_DATES["season14"])
     return (None, None)
 
 
@@ -335,8 +346,10 @@ def discover_runs(client: httpx.Client, settings: Settings, filters: RunFilters)
     created_after_cutoff = _parse_created_timestamp(filters.created_after)
     created_before_cutoff = _parse_created_timestamp(filters.created_before)
 
-    if filters.date_range == "latest_season":
+    if filters.date_range in {"latest_season", "season15"}:
         print("[crawl] using BazaarDB API feed for latest season", flush=True)
+    elif filters.date_range == "season14":
+        print("[crawl] using BazaarDB API feed for Season 14", flush=True)
     elif filters.date_range == "season13":
         print("[crawl] using BazaarDB API feed for Season 13", flush=True)
 
@@ -526,7 +539,7 @@ def _delete_stale_runs(conn, active_run_ids: set[int]) -> tuple[int, int]:
 def _is_full_discovery_scope(filters: RunFilters) -> bool:
     default_after, default_before = _created_bounds_for_date_range(filters.date_range)
     return (
-        filters.date_range in {"latest_season", "season13"}
+        filters.date_range in {"latest_season", "season15", "season14", "season13"}
         and filters.pages is None
         and filters.created_after == default_after
         and filters.created_before == default_before

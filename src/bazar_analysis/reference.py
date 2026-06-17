@@ -352,16 +352,13 @@ def _extract_cards_from_list_pages(list_urls: list[str], entity_type: str, setti
 
 def _extract_run_card_urls(settings: Settings) -> list[str]:
     urls: set[str] = set()
+    card_href_pattern = re.compile(r"href=[\"']([^\"']*/card/[^\"']+)[\"']")
     for html_path in settings.raw_runs_dir.glob("run_*.html"):
         try:
             html = html_path.read_text(encoding="utf-8")
         except Exception:
             continue
-        soup = BeautifulSoup(html, "html.parser")
-        for anchor in soup.select("a[href*='/card/']"):
-            href = anchor.get("href")
-            if not href:
-                continue
+        for href in card_href_pattern.findall(html):
             urls.add(urljoin("https://bazaardb.gg/", href))
     return sorted(urls)
 
@@ -440,8 +437,12 @@ def _download_icon(client: httpx.Client, image_url: str | None, target_dir: Path
     suffix = Path(urlparse(image_url).path).suffix or ".webp"
     output_path = target_dir / f"{entity_id}{suffix}"
     if not output_path.exists():
-        response = client.get(image_url)
-        response.raise_for_status()
+        try:
+            response = client.get(image_url)
+            response.raise_for_status()
+        except Exception as exc:
+            print(f"[reference] skipping icon {entity_id}: {type(exc).__name__}", flush=True)
+            return None
         output_path.write_bytes(response.content)
     return str(output_path)
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import typer
 
 from .analysis import summarize, systemic_analysis
@@ -84,6 +86,43 @@ def systemic_analysis_cmd() -> None:
     settings, conn = _bootstrap()
     result = systemic_analysis(conn, settings)
     typer.echo(result)
+
+
+@app.command("run-analysis-fast")
+def run_analysis_fast(
+    refresh_extraction: bool = typer.Option(
+        False,
+        "--refresh-extraction",
+        help="Rewrite extracted item/skill tables from run payloads before analysis.",
+    ),
+    export_base_datasets: bool = typer.Option(
+        False,
+        "--export-base-datasets",
+        help="Rewrite base CSV/Parquet exports in addition to summary exports.",
+    ),
+    systemic: bool = typer.Option(
+        True,
+        "--systemic/--no-systemic",
+        help="Include systemic archetype/core-build exports.",
+    ),
+) -> None:
+    """Refresh analysis summaries from run payloads without crawling references or screenshots."""
+    settings, conn = _bootstrap()
+    if refresh_extraction:
+        previous_source_only = os.environ.get("BAZAR_EXTRACT_SOURCE_ONLY")
+        os.environ["BAZAR_EXTRACT_SOURCE_ONLY"] = "1"
+        try:
+            typer.echo({"extract_board_data": extract_board_data(conn, settings)})
+        finally:
+            if previous_source_only is None:
+                os.environ.pop("BAZAR_EXTRACT_SOURCE_ONLY", None)
+            else:
+                os.environ["BAZAR_EXTRACT_SOURCE_ONLY"] = previous_source_only
+    if export_base_datasets:
+        typer.echo({"export_datasets": export_datasets(conn, settings)})
+    typer.echo({"summarize": summarize(conn, settings)})
+    if systemic:
+        typer.echo({"systemic_analysis": systemic_analysis(conn, settings)})
 
 
 @app.command("run-all")

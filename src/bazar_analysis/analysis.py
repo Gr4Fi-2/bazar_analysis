@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 import math
+from collections import Counter
 from itertools import combinations
 
 import polars as pl
 
 from .config import Settings
+
+
+PERFORMANCE_PRIOR_RUNS = 20.0
+MIN_CORE_BUILD_CLUSTER_BOARDS = 3
 
 
 def _cooccurrence(rows: list[list[str]], left_name: str, right_name: str) -> pl.DataFrame:
@@ -103,24 +108,147 @@ def _pipeline_coverage_summary(conn) -> pl.DataFrame:
         """
     )
 
-def _board_presence_frame(conn) -> tuple[pl.DataFrame, int]:
+def _empty_presence_frame(entity_column: str) -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "screenshot_id": pl.Int64,
+            "run_id": pl.Int64,
+            "hero": pl.String,
+            "title": pl.String,
+            "record_wins": pl.Int64,
+            "run_victory_tier": pl.String,
+            "has_broken_crown": pl.Int64,
+            "player_rank_tier": pl.String,
+            entity_column: pl.String,
+            "duplicate_count": pl.Int64,
+            "source_method": pl.String,
+        }
+    )
+
+
+def _parse_card_names(cards_json: str | None) -> list[str]:
+    if not cards_json:
+        return []
+    try:
+        parsed = json.loads(cards_json)
+    except json.JSONDecodeError:
+        return []
+    names: list[str] = []
+    for card in parsed:
+        if not isinstance(card, dict):
+            continue
+        name = card.get("title") or card.get("base_id")
+        if name:
+            names.append(str(name))
+    return names
+
+
+def _source_card_presence_frame(conn, cards_column: str, entity_column: str, source_method: str) -> pl.DataFrame:
+    rows = conn.execute(
+        f"""
+        SELECT
+            COALESCE(s.screenshot_id, -r.run_id) AS screenshot_id,
+            r.run_id,
+            r.hero,
+            r.title,
+            r.record_wins,
+            r.run_victory_tier,
+            r.has_broken_crown,
+            r.player_rank_tier,
+            CAST(r.{cards_column} AS VARCHAR) AS cards_json
+        FROM runs r
+        LEFT JOIN screenshots s ON s.run_id = r.run_id AND s.is_primary = 1
+        WHERE r.{cards_column} IS NOT NULL
+          AND json_array_length(r.{cards_column}) > 0
+        ORDER BY r.run_id
+        """
+    ).fetchall()
+    output_rows: list[dict[str, object]] = []
+    for row in rows:
+        name_counts = Counter(_parse_card_names(row["cards_json"]))
+        for name, duplicate_count in sorted(name_counts.items()):
+            output_rows.append(
+                {
+                    "screenshot_id": row["screenshot_id"],
+                    "run_id": row["run_id"],
+                    "hero": row["hero"],
+                    "title": row["title"],
+                    "record_wins": row["record_wins"],
+                    "run_victory_tier": row["run_victory_tier"],
+                    "has_broken_crown": row["has_broken_crown"],
+                    "player_rank_tier": row["player_rank_tier"],
+                    entity_column: name,
+                    "duplicate_count": duplicate_count,
+                    "source_method": source_method,
+                }
+            )
+    return pl.DataFrame(output_rows) if output_rows else _empty_presence_frame(entity_column)
+
+
+def _extracted_board_presence_frame(conn) -> pl.DataFrame:
     frame = conn.query_pl(
         """
         SELECT
             e.screenshot_id,
             s.run_id,
+            run_meta.hero,
             run_meta.title,
             run_meta.record_wins,
             run_meta.run_victory_tier,
             run_meta.has_broken_crown,
             run_meta.player_rank_tier,
-            COALESCE(ref_item.name, e.raw_label) AS item_name
+            COALESCE(ref_item.name, e.raw_label) AS item_name,
+            COALESCE(e.duplicate_count, 1) AS duplicate_count,
+            e.method AS source_method
         FROM extracted_board_items e
         JOIN screenshots s ON s.screenshot_id = e.screenshot_id
         JOIN runs run_meta ON run_meta.run_id = s.run_id
         LEFT JOIN reference_items ref_item ON ref_item.entity_id = e.entity_id
         WHERE e.status = 'ok'
         """
+    )
+    return frame if frame.height else _empty_presence_frame("item_name")
+
+
+def _extracted_skill_presence_frame(conn) -> pl.DataFrame:
+    frame = conn.query_pl(
+        """
+        SELECT
+            e.screenshot_id,
+            s.run_id,
+            run_meta.hero,
+            run_meta.title,
+            run_meta.record_wins,
+            run_meta.run_victory_tier,
+            run_meta.has_broken_crown,
+            run_meta.player_rank_tier,
+            COALESCE(ref_skill.name, e.raw_label) AS skill_name,
+            1 AS duplicate_count,
+            e.method AS source_method
+        FROM extracted_skills e
+        JOIN screenshots s ON s.screenshot_id = e.screenshot_id
+        JOIN runs run_meta ON run_meta.run_id = s.run_id
+        LEFT JOIN reference_skills ref_skill ON ref_skill.entity_id = e.entity_id
+        WHERE e.status = 'ok'
+        """
+    )
+    return frame if frame.height else _empty_presence_frame("skill_name")
+
+
+def _merge_source_with_extracted_fallback(source_frame: pl.DataFrame, extracted_frame: pl.DataFrame) -> pl.DataFrame:
+    if source_frame.height:
+        source_run_ids = source_frame.get_column("run_id").unique().to_list()
+        extracted_frame = extracted_frame.filter(~pl.col("run_id").is_in(source_run_ids)) if extracted_frame.height else extracted_frame
+    frames = [frame for frame in [source_frame, extracted_frame] if frame.height]
+    if not frames:
+        return source_frame
+    return pl.concat(frames, how="diagonal_relaxed")
+
+
+def _board_presence_frame(conn) -> tuple[pl.DataFrame, int]:
+    frame = _merge_source_with_extracted_fallback(
+        _source_card_presence_frame(conn, "board_cards_json", "item_name", "run_detail_board"),
+        _extracted_board_presence_frame(conn),
     )
     total_boards = int(frame.get_column("screenshot_id").n_unique()) if frame.height else 0
     return frame, total_boards
@@ -220,21 +348,9 @@ def _exact_item_triplets(board_frame: pl.DataFrame) -> pl.DataFrame:
 
 
 def _skill_presence_frame(conn) -> pl.DataFrame:
-    return conn.query_pl(
-        """
-        SELECT
-            e.screenshot_id,
-            s.run_id,
-            run_meta.title,
-            run_meta.record_wins,
-            run_meta.run_victory_tier,
-            COALESCE(ref_skill.name, e.raw_label) AS skill_name
-        FROM extracted_skills e
-        JOIN screenshots s ON s.screenshot_id = e.screenshot_id
-        JOIN runs run_meta ON run_meta.run_id = s.run_id
-        LEFT JOIN reference_skills ref_skill ON ref_skill.entity_id = e.entity_id
-        WHERE e.status = 'ok'
-        """
+    return _merge_source_with_extracted_fallback(
+        _source_card_presence_frame(conn, "skill_cards_json", "skill_name", "run_detail_skill"),
+        _extracted_skill_presence_frame(conn),
     )
 
 
@@ -244,6 +360,7 @@ def _run_meta_frame(conn) -> pl.DataFrame:
         SELECT
             s.screenshot_id,
             r.run_id,
+            r.hero,
             r.title,
             r.record_wins,
             r.run_wins_label,
@@ -283,7 +400,9 @@ def _systemic_item_pairs(board_frame: pl.DataFrame, total_boards: int) -> pl.Dat
         )
 
     item_counts = (
-        board_frame.group_by("item_name")
+        board_frame.select(["screenshot_id", "item_name"])
+        .unique()
+        .group_by("item_name")
         .len(name="board_count")
         .sort("board_count", descending=True)
         .rename({"item_name": "item"})
@@ -378,7 +497,7 @@ def _systemic_item_signatures(board_frame: pl.DataFrame, pair_frame: pl.DataFram
             }
         )
 
-    item_counts = board_frame.group_by("item_name").len(name="board_count")
+    item_counts = board_frame.select(["screenshot_id", "item_name"]).unique().group_by("item_name").len(name="board_count")
     pair_rows = pair_frame.iter_rows(named=True)
     partner_map: dict[str, list[dict[str, float | int | str]]] = {}
     for row in pair_rows:
@@ -537,8 +656,14 @@ def _build_core_builds(cluster_profile_frame: pl.DataFrame) -> pl.DataFrame:
     if not cluster_profile_frame.height:
         return _empty_build_cluster_outputs()[2]
 
+    supported_cluster_profile_frame = cluster_profile_frame.filter(
+        pl.col("board_count") >= MIN_CORE_BUILD_CLUSTER_BOARDS
+    )
+    if not supported_cluster_profile_frame.height:
+        return _empty_build_cluster_outputs()[2]
+
     grouped: dict[tuple[str, ...], dict[str, object]] = {}
-    for row in cluster_profile_frame.iter_rows(named=True):
+    for row in supported_cluster_profile_frame.iter_rows(named=True):
         core_items = tuple(sorted(entry["name"] for entry in json.loads(row["core_items_json"]) if entry.get("name")))
         if not core_items:
             continue
@@ -620,7 +745,7 @@ def _build_core_builds(cluster_profile_frame: pl.DataFrame) -> pl.DataFrame:
 
     if not rows:
         return _empty_build_cluster_outputs()[2]
-    return pl.DataFrame(rows).sort(["core_item_count", "board_count", "avg_wins"], descending=[True, True, True])
+    return pl.DataFrame(rows).sort(["board_count", "core_item_count", "avg_wins"], descending=[True, True, True])
 
 
 def _board_cluster_assignments(board_frame: pl.DataFrame, signature_frame: pl.DataFrame) -> pl.DataFrame:
@@ -874,27 +999,67 @@ def _entity_shell_affinity(cluster_assignment_frame: pl.DataFrame, entity_frame:
 
 
 def _performance_by_entity(frame: pl.DataFrame, entity_column: str) -> pl.DataFrame:
+    schema = {
+        entity_column: pl.String,
+        "run_count": pl.Int64,
+        "avg_wins": pl.Float64,
+        "weighted_avg_wins": pl.Float64,
+        "median_wins": pl.Float64,
+        "wins_10_count": pl.Int64,
+        "wins_10_rate": pl.Float64,
+        "gold_plus_rate": pl.Float64,
+        "weighted_gold_plus_rate": pl.Float64,
+        "gold_plus_delta": pl.Float64,
+        "perfect_rate": pl.Float64,
+        "weighted_perfect_rate": pl.Float64,
+        "perfect_delta": pl.Float64,
+        "top_outcome": pl.String,
+    }
     if not frame.height:
-        return pl.DataFrame(
-            schema={
-                entity_column: pl.String,
-                "run_count": pl.Int64,
-                "avg_wins": pl.Float64,
-                "median_wins": pl.Float64,
-                "wins_10_rate": pl.Float64,
-                "top_outcome": pl.String,
-            }
-        )
+        return pl.DataFrame(schema=schema)
+
+    unique_frame = frame.select(["screenshot_id", entity_column, "record_wins", "run_victory_tier"]).unique()
+    global_avg_wins = unique_frame.get_column("record_wins").drop_nulls().mean()
+    if global_avg_wins is None:
+        global_avg_wins = 0.0
+    global_gold_plus_rate = unique_frame.select(pl.col("run_victory_tier").is_in(["Gold", "Perfect"]).mean()).item()
+    if global_gold_plus_rate is None:
+        global_gold_plus_rate = 0.0
+    global_perfect_rate = unique_frame.select((pl.col("run_victory_tier") == "Perfect").mean()).item()
+    if global_perfect_rate is None:
+        global_perfect_rate = 0.0
+
     return (
-        frame.group_by(entity_column)
+        unique_frame.group_by(entity_column)
         .agg(
-            pl.col("screenshot_id").n_unique().alias("run_count"),
+            pl.len().alias("run_count"),
             pl.col("record_wins").drop_nulls().mean().alias("avg_wins"),
             pl.col("record_wins").drop_nulls().median().alias("median_wins"),
+            (pl.col("record_wins") == 10).sum().alias("wins_10_count"),
             (pl.col("record_wins") == 10).mean().alias("wins_10_rate"),
+            pl.col("run_victory_tier").is_in(["Gold", "Perfect"]).mean().alias("gold_plus_rate"),
+            (pl.col("run_victory_tier") == "Perfect").mean().alias("perfect_rate"),
             pl.col("run_victory_tier").drop_nulls().mode().first().alias("top_outcome"),
         )
-        .sort(["avg_wins", "run_count"], descending=[True, True])
+        .with_columns(
+            pl.when(pl.col("avg_wins").is_not_null())
+            .then(
+                ((pl.col("avg_wins") * pl.col("run_count")) + (pl.lit(global_avg_wins) * PERFORMANCE_PRIOR_RUNS))
+                / (pl.col("run_count") + PERFORMANCE_PRIOR_RUNS)
+            )
+            .otherwise(None)
+            .alias("weighted_avg_wins"),
+            (((pl.col("gold_plus_rate") * pl.col("run_count")) + (pl.lit(global_gold_plus_rate) * PERFORMANCE_PRIOR_RUNS))
+             / (pl.col("run_count") + PERFORMANCE_PRIOR_RUNS)).alias("weighted_gold_plus_rate"),
+            (((pl.col("perfect_rate") * pl.col("run_count")) + (pl.lit(global_perfect_rate) * PERFORMANCE_PRIOR_RUNS))
+             / (pl.col("run_count") + PERFORMANCE_PRIOR_RUNS)).alias("weighted_perfect_rate"),
+        )
+        .with_columns(
+            (pl.col("weighted_gold_plus_rate") - pl.lit(global_gold_plus_rate)).alias("gold_plus_delta"),
+            (pl.col("weighted_perfect_rate") - pl.lit(global_perfect_rate)).alias("perfect_delta"),
+        )
+        .select(list(schema))
+        .sort(["weighted_avg_wins", "run_count", "avg_wins"], descending=[True, True, True])
     )
 
 
@@ -905,52 +1070,109 @@ def _counts_with_performance(count_frame: pl.DataFrame, performance_frame: pl.Da
                 entity_column: pl.String,
                 "count": pl.Int64,
                 "avg_wins": pl.Float64,
+                "weighted_avg_wins": pl.Float64,
                 "median_wins": pl.Float64,
+                "wins_10_count": pl.Int64,
                 "wins_10_rate": pl.Float64,
+                "gold_plus_rate": pl.Float64,
+                "weighted_gold_plus_rate": pl.Float64,
+                "gold_plus_delta": pl.Float64,
+                "perfect_rate": pl.Float64,
+                "weighted_perfect_rate": pl.Float64,
+                "perfect_delta": pl.Float64,
                 "top_outcome": pl.String,
             }
         )
     return (
         count_frame.join(performance_frame, on=entity_column, how="left")
-        .sort(["count", "avg_wins"], descending=[True, True])
+        .sort(["count", "weighted_avg_wins", "avg_wins"], descending=[True, True, True])
     )
 
 
-def _item_source_alignment(conn, board_frame: pl.DataFrame) -> pl.DataFrame:
-    item_counts = board_frame.group_by("item_name").len(name="board_count") if board_frame.height else pl.DataFrame({"item_name": [], "board_count": []})
-    source_rows = conn.execute("SELECT board_cards_json FROM runs").fetchall()
-    source_counter: dict[str, int] = {}
-    for row in source_rows:
-        for card in json.loads(row["board_cards_json"] or "[]"):
-            if not isinstance(card, dict):
-                continue
-            item_name = card.get("title")
-            if item_name:
-                source_counter[item_name] = source_counter.get(item_name, 0) + 1
+def _performance_by_hero(frame: pl.DataFrame, entity_column: str) -> pl.DataFrame:
+    if not frame.height or "hero" not in frame.columns:
+        return pl.DataFrame()
+    frames: list[pl.DataFrame] = []
+    heroes = sorted(hero for hero in frame.get_column("hero").drop_nulls().unique().to_list() if hero)
+    for hero in heroes:
+        hero_frame = frame.filter(pl.col("hero") == hero)
+        performance = _performance_by_entity(hero_frame, entity_column)
+        if performance.height:
+            frames.append(performance.with_columns(pl.lit(hero).alias("hero")).select(["hero", *performance.columns]))
+    return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
-    names = sorted(set(item_counts.get_column("item_name").to_list()) | set(source_counter)) if item_counts.height else sorted(source_counter)
+
+def _counts_with_performance_by_hero(count_frame: pl.DataFrame, performance_frame: pl.DataFrame, entity_column: str) -> pl.DataFrame:
+    if not count_frame.height:
+        return pl.DataFrame()
+    if not performance_frame.height:
+        return count_frame
+    return count_frame.join(performance_frame, on=["hero", entity_column], how="left").sort(
+        ["hero", "count", "weighted_avg_wins", "avg_wins"],
+        descending=[False, True, True, True],
+    )
+
+
+def _cooccurrence_by_hero(presence_frame: pl.DataFrame, entity_column: str, left_name: str, right_name: str) -> pl.DataFrame:
+    if not presence_frame.height:
+        return pl.DataFrame()
+    frames: list[pl.DataFrame] = []
+    for hero in sorted(hero for hero in presence_frame.get_column("hero").drop_nulls().unique().to_list() if hero):
+        hero_presence = presence_frame.filter(pl.col("hero") == hero)
+        lists = hero_presence.group_by("screenshot_id").agg(pl.col(entity_column)).get_column(entity_column).to_list()
+        cooccurrence = _cooccurrence(lists, left_name, right_name)
+        if cooccurrence.height:
+            frames.append(cooccurrence.with_columns(pl.lit(hero).alias("hero")).select(["hero", *cooccurrence.columns]))
+    return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
+
+def _write_if_not_empty(frame: pl.DataFrame, path) -> int:
+    frame.write_csv(path)
+    return frame.height
+
+
+def _item_source_alignment(conn, board_frame: pl.DataFrame) -> pl.DataFrame:
+    item_counts = (
+        board_frame.select(["screenshot_id", "item_name"]).unique().group_by("item_name").len(name="analysis_board_count")
+        if board_frame.height
+        else pl.DataFrame({"item_name": [], "analysis_board_count": []})
+    )
+    source_rows = conn.execute("SELECT run_id, board_cards_json FROM runs").fetchall()
+    source_copy_counter: dict[str, int] = {}
+    source_board_counter: dict[str, int] = {}
+    for row in source_rows:
+        names = _parse_card_names(row["board_cards_json"])
+        for item_name in names:
+            source_copy_counter[item_name] = source_copy_counter.get(item_name, 0) + 1
+        for item_name in set(names):
+            source_board_counter[item_name] = source_board_counter.get(item_name, 0) + 1
+
+    names = sorted(set(item_counts.get_column("item_name").to_list()) | set(source_board_counter)) if item_counts.height else sorted(source_board_counter)
     rows: list[dict[str, float | int | str | None]] = []
-    item_count_map = dict(zip(item_counts.get_column("item_name").to_list(), item_counts.get_column("board_count").to_list(), strict=False)) if item_counts.height else {}
+    item_count_map = dict(zip(item_counts.get_column("item_name").to_list(), item_counts.get_column("analysis_board_count").to_list(), strict=False)) if item_counts.height else {}
     for name in names:
-        board_count = int(item_count_map.get(name, 0))
-        source_count = int(source_counter.get(name, 0))
-        extraction_to_source_ratio = (board_count / source_count) if source_count else None
+        analysis_board_count = int(item_count_map.get(name, 0))
+        source_board_count = int(source_board_counter.get(name, 0))
+        source_copy_count = int(source_copy_counter.get(name, 0))
+        analysis_to_source_board_ratio = (analysis_board_count / source_board_count) if source_board_count else None
         rows.append(
             {
                 "item_name": name,
-                "board_count": board_count,
-                "source_count": source_count,
-                "extraction_to_source_ratio": extraction_to_source_ratio,
-                "board_minus_source": board_count - source_count,
+                "analysis_board_count": analysis_board_count,
+                "source_board_count": source_board_count,
+                "source_copy_count": source_copy_count,
+                "analysis_to_source_board_ratio": analysis_to_source_board_ratio,
+                "analysis_minus_source_boards": analysis_board_count - source_board_count,
             }
         )
-    return pl.DataFrame(rows).sort(["board_minus_source", "board_count"], descending=[True, True]) if rows else pl.DataFrame(
+    return pl.DataFrame(rows).sort(["analysis_minus_source_boards", "analysis_board_count"], descending=[True, True]) if rows else pl.DataFrame(
         schema={
             "item_name": pl.String,
-            "board_count": pl.Int64,
-            "source_count": pl.Int64,
-            "extraction_to_source_ratio": pl.Float64,
-            "board_minus_source": pl.Int64,
+            "analysis_board_count": pl.Int64,
+            "source_board_count": pl.Int64,
+            "source_copy_count": pl.Int64,
+            "analysis_to_source_board_ratio": pl.Float64,
+            "analysis_minus_source_boards": pl.Int64,
         }
     )
 
@@ -968,6 +1190,53 @@ def systemic_analysis(conn, settings: Settings) -> dict[str, int]:
     exact_triplet_frame = _exact_item_triplets(board_frame)
     source_alignment = _item_source_alignment(conn, board_frame)
 
+    hero_pair_frames: list[pl.DataFrame] = []
+    hero_signature_frames: list[pl.DataFrame] = []
+    hero_archetype_frames: list[pl.DataFrame] = []
+    hero_cluster_profile_frames: list[pl.DataFrame] = []
+    hero_cluster_component_frames: list[pl.DataFrame] = []
+    hero_core_build_frames: list[pl.DataFrame] = []
+    hero_skill_shell_affinity_frames: list[pl.DataFrame] = []
+    hero_item_shell_affinity_frames: list[pl.DataFrame] = []
+    hero_exact_triplet_frames: list[pl.DataFrame] = []
+    heroes = sorted(hero for hero in board_frame.get_column("hero").drop_nulls().unique().to_list() if hero) if board_frame.height else []
+    for hero in heroes:
+        hero_board_frame = board_frame.filter(pl.col("hero") == hero)
+        hero_skill_frame = skill_frame.filter(pl.col("hero") == hero) if skill_frame.height else skill_frame
+        hero_total_boards = int(hero_board_frame.get_column("screenshot_id").n_unique()) if hero_board_frame.height else 0
+        hero_pair_frame = _systemic_item_pairs(hero_board_frame, hero_total_boards)
+        hero_signature_frame = _systemic_item_signatures(hero_board_frame, hero_pair_frame, hero_total_boards)
+        hero_archetype_frame = _systemic_archetypes(hero_board_frame, hero_signature_frame)
+        hero_cluster_assignment_frame = _board_cluster_assignments(hero_board_frame, hero_signature_frame)
+        hero_cluster_profile_frame, hero_cluster_component_frame, hero_core_build_frame = _build_cluster_profiles(hero_cluster_assignment_frame, hero_skill_frame)
+        hero_skill_shell_affinity_frame = _entity_shell_affinity(hero_cluster_assignment_frame, hero_skill_frame.select(["screenshot_id", "skill_name"]), "skill_name") if hero_skill_frame.height else pl.DataFrame()
+        hero_item_shell_affinity_frame = _entity_shell_affinity(hero_cluster_assignment_frame, hero_board_frame.select(["screenshot_id", "item_name"]), "item_name")
+        hero_exact_triplet_frame = _exact_item_triplets(hero_board_frame)
+
+        for frame, frames in [
+            (hero_pair_frame, hero_pair_frames),
+            (hero_signature_frame, hero_signature_frames),
+            (hero_archetype_frame, hero_archetype_frames),
+            (hero_cluster_profile_frame, hero_cluster_profile_frames),
+            (hero_cluster_component_frame, hero_cluster_component_frames),
+            (hero_core_build_frame, hero_core_build_frames),
+            (hero_skill_shell_affinity_frame, hero_skill_shell_affinity_frames),
+            (hero_item_shell_affinity_frame, hero_item_shell_affinity_frames),
+            (hero_exact_triplet_frame, hero_exact_triplet_frames),
+        ]:
+            if frame.height:
+                frames.append(frame.with_columns(pl.lit(hero).alias("hero")).select(["hero", *frame.columns]))
+
+    hero_pair_frame = pl.concat(hero_pair_frames, how="diagonal_relaxed") if hero_pair_frames else pl.DataFrame()
+    hero_signature_frame = pl.concat(hero_signature_frames, how="diagonal_relaxed") if hero_signature_frames else pl.DataFrame()
+    hero_archetype_frame = pl.concat(hero_archetype_frames, how="diagonal_relaxed") if hero_archetype_frames else pl.DataFrame()
+    hero_cluster_profile_frame = pl.concat(hero_cluster_profile_frames, how="diagonal_relaxed") if hero_cluster_profile_frames else pl.DataFrame()
+    hero_cluster_component_frame = pl.concat(hero_cluster_component_frames, how="diagonal_relaxed") if hero_cluster_component_frames else pl.DataFrame()
+    hero_core_build_frame = pl.concat(hero_core_build_frames, how="diagonal_relaxed") if hero_core_build_frames else pl.DataFrame()
+    hero_skill_shell_affinity_frame = pl.concat(hero_skill_shell_affinity_frames, how="diagonal_relaxed") if hero_skill_shell_affinity_frames else pl.DataFrame()
+    hero_item_shell_affinity_frame = pl.concat(hero_item_shell_affinity_frames, how="diagonal_relaxed") if hero_item_shell_affinity_frames else pl.DataFrame()
+    hero_exact_triplet_frame = pl.concat(hero_exact_triplet_frames, how="diagonal_relaxed") if hero_exact_triplet_frames else pl.DataFrame()
+
     pair_frame.write_csv(settings.exports_dir / "summary_systemic_item_pairs.csv")
     signature_frame.write_csv(settings.exports_dir / "summary_systemic_item_signatures.csv")
     archetype_frame.write_csv(settings.exports_dir / "summary_systemic_archetypes.csv")
@@ -978,6 +1247,15 @@ def systemic_analysis(conn, settings: Settings) -> dict[str, int]:
     item_shell_affinity_frame.write_csv(settings.exports_dir / "summary_item_shell_affinity.csv")
     exact_triplet_frame.write_csv(settings.exports_dir / "summary_exact_item_triplets.csv")
     source_alignment.write_csv(settings.exports_dir / "summary_item_source_alignment.csv")
+    hero_pair_frame.write_csv(settings.exports_dir / "summary_systemic_item_pairs_by_hero.csv")
+    hero_signature_frame.write_csv(settings.exports_dir / "summary_systemic_item_signatures_by_hero.csv")
+    hero_archetype_frame.write_csv(settings.exports_dir / "summary_systemic_archetypes_by_hero.csv")
+    hero_cluster_profile_frame.write_csv(settings.exports_dir / "summary_build_clusters_by_hero.csv")
+    hero_cluster_component_frame.write_csv(settings.exports_dir / "summary_build_components_by_hero.csv")
+    hero_core_build_frame.write_csv(settings.exports_dir / "summary_core_builds_by_hero.csv")
+    hero_skill_shell_affinity_frame.write_csv(settings.exports_dir / "summary_skill_shell_affinity_by_hero.csv")
+    hero_item_shell_affinity_frame.write_csv(settings.exports_dir / "summary_item_shell_affinity_by_hero.csv")
+    hero_exact_triplet_frame.write_csv(settings.exports_dir / "summary_exact_item_triplets_by_hero.csv")
 
     return {
         "boards": total_boards,
@@ -991,76 +1269,104 @@ def systemic_analysis(conn, settings: Settings) -> dict[str, int]:
         "item_shell_affinity_rows": item_shell_affinity_frame.height,
         "exact_item_triplets": exact_triplet_frame.height,
         "source_alignment_rows": source_alignment.height,
+        "heroes": len(heroes),
+        "systemic_pairs_by_hero": hero_pair_frame.height,
+        "core_builds_by_hero": hero_core_build_frame.height,
+        "exact_item_triplets_by_hero": hero_exact_triplet_frame.height,
     }
 
 
 def summarize(conn, settings: Settings) -> dict[str, int]:
-    item_frame = conn.query_pl(
-        """
-        SELECT e.screenshot_id, COALESCE(r.name, e.raw_label) AS item_name
-        FROM extracted_board_items e
-        JOIN screenshots s ON s.screenshot_id = e.screenshot_id
-        JOIN runs ON runs.run_id = s.run_id
-        LEFT JOIN reference_items r ON r.entity_id = e.entity_id
-        WHERE e.status = 'ok'
-        """
-    )
-    skill_frame = conn.query_pl(
-        """
-        SELECT e.screenshot_id, COALESCE(r.name, e.raw_label) AS skill_name
-        FROM extracted_skills e
-        JOIN screenshots s ON s.screenshot_id = e.screenshot_id
-        JOIN runs ON runs.run_id = s.run_id
-        LEFT JOIN reference_skills r ON r.entity_id = e.entity_id
-        WHERE e.status = 'ok'
-        """
-    )
+    item_frame, _total_boards = _board_presence_frame(conn)
+    skill_frame = _skill_presence_frame(conn)
     outcome_frame = conn.query_pl(
         """
-        SELECT s.screenshot_id, r.outcome_text
+        SELECT COALESCE(s.screenshot_id, -r.run_id) AS screenshot_id, r.hero, r.outcome_text
         FROM screenshots s
         JOIN runs r ON r.run_id = s.run_id
         WHERE s.is_primary = 1
         """
     )
     run_meta_frame = _run_meta_frame(conn)
+    item_presence_frame = item_frame.select(["screenshot_id", "hero", "item_name"]).unique() if item_frame.height else item_frame.select(["screenshot_id", "hero", "item_name"])
+    skill_presence_frame = skill_frame.select(["screenshot_id", "hero", "skill_name"]).unique() if skill_frame.height else skill_frame.select(["screenshot_id", "hero", "skill_name"])
 
-    item_perf_frame = item_frame.join(run_meta_frame.select(["screenshot_id", "record_wins", "run_victory_tier"]), on="screenshot_id", how="left") if item_frame.height else pl.DataFrame(schema={"screenshot_id": pl.Int64, "item_name": pl.String, "record_wins": pl.Int64, "run_victory_tier": pl.String})
-    skill_perf_frame = skill_frame.join(run_meta_frame.select(["screenshot_id", "record_wins", "run_victory_tier"]), on="screenshot_id", how="left") if skill_frame.height else pl.DataFrame(schema={"screenshot_id": pl.Int64, "skill_name": pl.String, "record_wins": pl.Int64, "run_victory_tier": pl.String})
+    item_perf_frame = (
+        item_presence_frame.join(
+            run_meta_frame.select(["screenshot_id", "record_wins", "run_victory_tier"]),
+            on="screenshot_id",
+            how="left",
+        )
+        if item_presence_frame.height
+        else pl.DataFrame(schema={"screenshot_id": pl.Int64, "item_name": pl.String, "record_wins": pl.Int64, "run_victory_tier": pl.String})
+    )
+    skill_perf_frame = (
+        skill_presence_frame.join(
+            run_meta_frame.select(["screenshot_id", "record_wins", "run_victory_tier"]),
+            on="screenshot_id",
+            how="left",
+        )
+        if skill_presence_frame.height
+        else pl.DataFrame(schema={"screenshot_id": pl.Int64, "skill_name": pl.String, "record_wins": pl.Int64, "run_victory_tier": pl.String})
+    )
 
-    top_items = item_frame.group_by("item_name").len(name="count").sort("count", descending=True)
-    top_skills = skill_frame.group_by("skill_name").len(name="count").sort("count", descending=True)
-    item_lists = item_frame.group_by("screenshot_id").agg(pl.col("item_name")).get_column("item_name").to_list() if item_frame.height else []
+    top_items = item_presence_frame.group_by("item_name").len(name="count").sort("count", descending=True)
+    top_skills = skill_presence_frame.group_by("skill_name").len(name="count").sort("count", descending=True)
+    top_items_by_hero = item_presence_frame.group_by(["hero", "item_name"]).len(name="count").sort(["hero", "count"], descending=[False, True]) if item_presence_frame.height else pl.DataFrame()
+    top_skills_by_hero = skill_presence_frame.group_by(["hero", "skill_name"]).len(name="count").sort(["hero", "count"], descending=[False, True]) if skill_presence_frame.height else pl.DataFrame()
+    item_lists = item_presence_frame.group_by("screenshot_id").agg(pl.col("item_name")).get_column("item_name").to_list() if item_presence_frame.height else []
     item_pair_counts = _cooccurrence(item_lists, "item_a", "item_b")
+    item_pair_counts_by_hero = _cooccurrence_by_hero(item_presence_frame, "item_name", "item_a", "item_b")
 
-    item_skill_join = item_frame.join(skill_frame, on="screenshot_id", how="inner")
+    item_skill_join = item_presence_frame.join(skill_presence_frame, on=["screenshot_id", "hero"], how="inner")
     item_skill_counts = item_skill_join.group_by(["item_name", "skill_name"]).len(name="count").sort("count", descending=True)
+    item_skill_counts_by_hero = item_skill_join.group_by(["hero", "item_name", "skill_name"]).len(name="count").sort(["hero", "count"], descending=[False, True]) if item_skill_join.height else pl.DataFrame()
 
-    outcome_items = item_frame.join(outcome_frame, on="screenshot_id", how="left")
+    outcome_items = item_presence_frame.join(outcome_frame, on="screenshot_id", how="left")
     outcome_item_counts = outcome_items.filter(pl.col("outcome_text").is_not_null()).group_by(["outcome_text", "item_name"]).len(name="count").sort(["outcome_text", "count"], descending=[False, True])
+    outcome_item_counts_by_hero = outcome_items.filter(pl.col("outcome_text").is_not_null()).group_by(["hero", "outcome_text", "item_name"]).len(name="count").sort(["hero", "outcome_text", "count"], descending=[False, False, True]) if outcome_items.height else pl.DataFrame()
     coverage = _pipeline_coverage_summary(conn)
     item_performance = _performance_by_entity(item_perf_frame, "item_name")
     skill_performance = _performance_by_entity(skill_perf_frame, "skill_name")
+    item_performance_by_hero = _performance_by_hero(item_perf_frame, "item_name")
+    skill_performance_by_hero = _performance_by_hero(skill_perf_frame, "skill_name")
     item_counts_performance = _counts_with_performance(top_items, item_performance, "item_name")
+    item_counts_performance_by_hero = _counts_with_performance_by_hero(top_items_by_hero, item_performance_by_hero, "item_name")
 
     top_items.write_csv(settings.exports_dir / "summary_top_items.csv")
     top_skills.write_csv(settings.exports_dir / "summary_top_skills.csv")
+    top_items_by_hero.write_csv(settings.exports_dir / "summary_top_items_by_hero.csv")
+    top_skills_by_hero.write_csv(settings.exports_dir / "summary_top_skills_by_hero.csv")
     item_pair_counts.write_csv(settings.exports_dir / "summary_item_item_cooccurrence.csv")
+    item_pair_counts_by_hero.write_csv(settings.exports_dir / "summary_item_item_cooccurrence_by_hero.csv")
     item_skill_counts.write_csv(settings.exports_dir / "summary_item_skill_cooccurrence.csv")
+    item_skill_counts_by_hero.write_csv(settings.exports_dir / "summary_item_skill_cooccurrence_by_hero.csv")
     outcome_item_counts.write_csv(settings.exports_dir / "summary_outcome_filtered_items.csv")
+    outcome_item_counts_by_hero.write_csv(settings.exports_dir / "summary_outcome_filtered_items_by_hero.csv")
     coverage.write_csv(settings.exports_dir / "summary_pipeline_coverage.csv")
     item_performance.write_csv(settings.exports_dir / "summary_item_performance.csv")
     skill_performance.write_csv(settings.exports_dir / "summary_skill_performance.csv")
+    item_performance_by_hero.write_csv(settings.exports_dir / "summary_item_performance_by_hero.csv")
+    skill_performance_by_hero.write_csv(settings.exports_dir / "summary_skill_performance_by_hero.csv")
     item_counts_performance.write_csv(settings.exports_dir / "summary_item_counts_performance.csv")
+    item_counts_performance_by_hero.write_csv(settings.exports_dir / "summary_item_counts_performance_by_hero.csv")
 
     return {
         "top_items": top_items.height,
         "top_skills": top_skills.height,
+        "top_items_by_hero": top_items_by_hero.height,
+        "top_skills_by_hero": top_skills_by_hero.height,
         "item_item_pairs": item_pair_counts.height,
+        "item_item_pairs_by_hero": item_pair_counts_by_hero.height,
         "item_skill_pairs": item_skill_counts.height,
+        "item_skill_pairs_by_hero": item_skill_counts_by_hero.height,
         "outcome_filtered_rows": outcome_item_counts.height,
+        "outcome_filtered_rows_by_hero": outcome_item_counts_by_hero.height,
         "pipeline_coverage_rows": coverage.height,
         "item_performance_rows": item_performance.height,
         "skill_performance_rows": skill_performance.height,
+        "item_performance_rows_by_hero": item_performance_by_hero.height,
+        "skill_performance_rows_by_hero": skill_performance_by_hero.height,
         "item_counts_performance_rows": item_counts_performance.height,
+        "item_counts_performance_rows_by_hero": item_counts_performance_by_hero.height,
     }
