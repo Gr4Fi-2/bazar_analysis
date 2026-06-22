@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,7 @@ from .utils import (
 
 RUNS_URL = "https://bazaardb.gg/run"
 RUN_PATH_PATTERN = re.compile(r"^/run/([0-9a-f-]+)$", flags=re.IGNORECASE)
+ALL_RUN_HEROES = ("Vanessa", "Stelle", "Dooley", "Pygmalien", "Jules", "Mak", "Karnok")
 RANK_ORDER = {
     "Bronze": 1,
     "Silver": 2,
@@ -68,11 +70,15 @@ class RunFilters:
 
 
 def _load_run_filters() -> RunFilters:
-    heroes = {
-        hero.strip().title()
-        for hero in os.environ.get("BAZAR_RUN_HEROES", "Jules").split(",")
-        if hero.strip()
-    }
+    heroes: set[str] = set()
+    for hero in os.environ.get("BAZAR_RUN_HEROES", "Jules").split(","):
+        token = hero.strip()
+        if not token:
+            continue
+        if token.lower() in {"all", "*"}:
+            heroes.update(ALL_RUN_HEROES)
+        else:
+            heroes.add(token.title())
     min_rank = normalize_player_rank_tier(os.environ.get("BAZAR_RUN_MIN_RANK", "").strip())
     date_range = os.environ.get("BAZAR_RUN_DATE_RANGE", "latest_season").strip().lower()
     pages_raw = os.environ.get("BAZAR_RUN_DISCOVERY_PAGES", "0").strip().lower()
@@ -158,6 +164,15 @@ def build_client() -> httpx.Client:
 def save_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def _use_html_cache() -> bool:
+    return os.environ.get("BAZAR_CRAWL_USE_HTML_CACHE", "1") != "0"
+
+
+def _is_unusable_cached_html(html: str) -> bool:
+    lowered = html.lower()
+    return not html.strip() or ("just a moment" in lowered and "cloudflare" in lowered)
 
 
 def _collapse_whitespace(value: str) -> str:
@@ -338,6 +353,12 @@ def _extract_player_rank_tier(run_payload: dict | None) -> str | None:
     return None
 
 
+def _snapshot_scope_label(filters: RunFilters) -> str:
+    heroes = "-".join(sorted(hero.lower().replace(" ", "-") for hero in filters.heroes)) or "all"
+    label = f"{filters.date_range}_{heroes}_{filters.sort}_{filters.order}"
+    return re.sub(r"[^a-z0-9_.-]+", "-", label.lower()).strip("-") or "runs"
+
+
 def discover_runs(client: httpx.Client, settings: Settings, filters: RunFilters) -> RunDiscoveryResult:
     runs: list[RunRecord] = []
     seen_ids: set[str] = set()
@@ -365,7 +386,10 @@ def discover_runs(client: httpx.Client, settings: Settings, filters: RunFilters)
             exhausted = False
             print(f"[crawl] stopping discovery after page {page_number - 1}: {type(exc).__name__}", flush=True)
             break
-        save_text(settings.raw_runs_dir / f"run_api_page_{page_number}.json", json.dumps(page_payload, ensure_ascii=True, sort_keys=True))
+        save_text(
+            settings.raw_runs_dir / f"run_api_{_snapshot_scope_label(filters)}_page_{page_number}.json",
+            json.dumps(page_payload, ensure_ascii=True, sort_keys=True),
+        )
         page_runs = 0
         reached_created_after_cutoff = False
         for payload in page_payload:
@@ -412,10 +436,14 @@ def discover_runs(client: httpx.Client, settings: Settings, filters: RunFilters)
 
 
 def parse_run(client: httpx.Client, settings: Settings, run: RunRecord, delay_seconds: float) -> dict:
-    html = fetch_text(client, run.run_url, delay_seconds)
     run_slug = safe_stem_from_url(run.run_url)
     html_path = settings.raw_runs_dir / f"run_{run_slug}.html"
-    save_text(html_path, html)
+    html = ""
+    if _use_html_cache() and html_path.exists():
+        html = html_path.read_text(encoding="utf-8")
+    if _is_unusable_cached_html(html):
+        html = fetch_text(client, run.run_url, delay_seconds)
+        save_text(html_path, html)
 
     soup = BeautifulSoup(html, "html.parser")
     page_text = _collapse_whitespace(soup.get_text(" ", strip=True))
@@ -510,15 +538,20 @@ def _delete_screenshots(conn, screenshot_ids: list[int]) -> int:
     return len(screenshot_ids)
 
 
-def _delete_stale_runs(conn, active_run_ids: set[int]) -> tuple[int, int]:
+def _delete_stale_runs(conn, active_run_ids: set[int], filters: RunFilters) -> tuple[int, int]:
+    conditions: list[str] = []
+    parameters: list[object] = []
+    if filters.heroes:
+        hero_placeholders = ", ".join("?" for _ in filters.heroes)
+        conditions.append(f"hero IN ({hero_placeholders})")
+        parameters.extend(sorted(filters.heroes))
     if active_run_ids:
         run_placeholders = ", ".join("?" for _ in active_run_ids)
-        stale_run_rows = conn.execute(
-            f"SELECT run_id FROM runs WHERE run_id NOT IN ({run_placeholders})",
-            tuple(sorted(active_run_ids)),
-        ).fetchall()
-    else:
-        stale_run_rows = conn.execute("SELECT run_id FROM runs").fetchall()
+        conditions.append(f"run_id NOT IN ({run_placeholders})")
+        parameters.extend(sorted(active_run_ids))
+
+    where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+    stale_run_rows = conn.execute(f"SELECT run_id FROM runs{where_clause}", tuple(parameters)).fetchall()
 
     stale_run_ids = [row["run_id"] for row in stale_run_rows]
     if not stale_run_ids:
@@ -541,9 +574,163 @@ def _is_full_discovery_scope(filters: RunFilters) -> bool:
     return (
         filters.date_range in {"latest_season", "season15", "season14", "season13"}
         and filters.pages is None
+        and filters.min_rank is None
         and filters.created_after == default_after
         and filters.created_before == default_before
     )
+
+
+def _crawl_workers() -> int:
+    raw_value = os.environ.get("BAZAR_CRAWL_WORKERS", "1").strip()
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return 1
+
+
+def _discovery_filter_scopes(filters: RunFilters) -> list[RunFilters]:
+    if len(filters.heroes) <= 1:
+        return [filters]
+    return [replace(filters, heroes={hero}) for hero in sorted(filters.heroes)]
+
+
+def _parse_discovered_runs(client: httpx.Client, settings: Settings, runs: list[RunRecord], filters: RunFilters):
+    workers = _crawl_workers()
+    if workers <= 1 or len(runs) <= 1:
+        for index, run in enumerate(runs, start=1):
+            if index == 1 or index % 10 == 0 or index == len(runs):
+                print(f"[crawl] run {index}/{len(runs)}: {run.run_url}", flush=True)
+            try:
+                yield run, parse_run(client, settings, run, filters.request_delay_seconds), None
+            except Exception as exc:
+                yield run, None, exc
+        return
+
+    print(f"[crawl] parsing run details with {workers} workers", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {executor.submit(parse_run, client, settings, run, filters.request_delay_seconds): run for run in runs}
+        completed = 0
+        for future in as_completed(future_map):
+            completed += 1
+            run = future_map[future]
+            if completed == 1 or completed % 10 == 0 or completed == len(runs):
+                print(f"[crawl] run {completed}/{len(runs)} parsed: {run.run_url}", flush=True)
+            try:
+                yield run, future.result(), None
+            except Exception as exc:
+                yield run, None, exc
+
+
+def _upsert_run_record(conn, run: RunRecord, record: dict, now: str) -> tuple[int, int]:
+    existing_run = conn.execute("SELECT run_id FROM runs WHERE source_run_id = ?", (run.source_run_id,)).fetchone()
+    if existing_run:
+        run_id = existing_run["run_id"]
+        conn.execute(
+            """
+            UPDATE runs
+            SET hero = ?, run_url = ?, created_at = ?, title = ?, profile_name = ?, profile_url = ?, outcome_text = ?, record_wins = ?, record_losses = ?,
+                run_wins_label = ?, run_victory_tier = ?, run_victory_label = ?, player_rank_tier = COALESCE(?, player_rank_tier), player_rank_label = COALESCE(?, player_rank_label), has_broken_crown = ?, max_health = ?, prestige = ?, level = ?, income = ?, gold = ?, html_path = ?,
+                card_hints_json = ?, board_cards_json = ?, skill_cards_json = ?, crawled_at = ?
+            WHERE run_id = ?
+            """,
+            (
+                record["hero"],
+                record["run_url"],
+                record["created_at"],
+                record["title"],
+                record["profile_name"],
+                record["profile_url"],
+                record["outcome_text"],
+                record["record_wins"],
+                record["record_losses"],
+                record["run_wins_label"],
+                record["run_victory_tier"],
+                record["run_victory_label"],
+                record["player_rank_tier"],
+                record["player_rank_label"],
+                record["has_broken_crown"],
+                record["max_health"],
+                record["prestige"],
+                record["level"],
+                record["income"],
+                record["gold"],
+                record["html_path"],
+                json_dumps(record["card_hints"]),
+                json_dumps(record["board_cards"]),
+                json_dumps(record["skill_cards"]),
+                now,
+                run_id,
+            ),
+        )
+    else:
+        run_id = next_id(conn, "runs", "run_id")
+        conn.execute(
+            """
+            INSERT INTO runs(run_id, source_run_id, hero, run_url, created_at, title, profile_name, profile_url, outcome_text, record_wins, record_losses,
+                             run_wins_label, run_victory_tier, run_victory_label, player_rank_tier, player_rank_label, has_broken_crown, max_health, prestige, level,
+                             income, gold, html_path, card_hints_json, board_cards_json, skill_cards_json, crawled_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                record["source_run_id"],
+                record["hero"],
+                record["run_url"],
+                record["created_at"],
+                record["title"],
+                record["profile_name"],
+                record["profile_url"],
+                record["outcome_text"],
+                record["record_wins"],
+                record["record_losses"],
+                record["run_wins_label"],
+                record["run_victory_tier"],
+                record["run_victory_label"],
+                record["player_rank_tier"],
+                record["player_rank_label"],
+                record["has_broken_crown"],
+                record["max_health"],
+                record["prestige"],
+                record["level"],
+                record["income"],
+                record["gold"],
+                record["html_path"],
+                json_dumps(record["card_hints"]),
+                json_dumps(record["board_cards"]),
+                json_dumps(record["skill_cards"]),
+                now,
+            ),
+        )
+
+    existing_screenshots = conn.execute(
+        "SELECT screenshot_id, screenshot_url FROM screenshots WHERE run_id = ?",
+        (run_id,),
+    ).fetchall()
+    existing_screenshot_map = {row["screenshot_url"]: row["screenshot_id"] for row in existing_screenshots}
+    stale_screenshot_ids = [
+        screenshot_id
+        for screenshot_url, screenshot_id in existing_screenshot_map.items()
+        if screenshot_url not in record["screenshot_urls"]
+    ]
+    _delete_screenshots(conn, stale_screenshot_ids)
+    inserted_screenshots = 0
+    for idx, screenshot_url in enumerate(record["screenshot_urls"]):
+        existing_screenshot_id = existing_screenshot_map.get(screenshot_url)
+        if existing_screenshot_id is not None:
+            conn.execute(
+                "UPDATE screenshots SET is_primary = ? WHERE screenshot_id = ?",
+                (1 if idx == 0 else 0, existing_screenshot_id),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO screenshots(screenshot_id, run_id, screenshot_url, is_primary)
+                VALUES(?, ?, ?, ?)
+                """,
+                (next_id(conn, "screenshots", "screenshot_id"), run_id, screenshot_url, 1 if idx == 0 else 0),
+            )
+            inserted_screenshots += 1
+    return run_id, inserted_screenshots
 
 
 def crawl_runs(conn, settings: Settings) -> dict[str, int]:
@@ -554,149 +741,53 @@ def crawl_runs(conn, settings: Settings) -> dict[str, int]:
     skipped_filters = 0
     run_failures = 0
     active_run_ids: set[int] = set()
+    discovery_exhausted = True
+    filter_scopes = _discovery_filter_scopes(filters)
 
     with build_client() as client:
-        discovery = discover_runs(client, settings, filters)
-        runs = discovery.runs
-        print(f"[crawl] processing {len(runs)} runs", flush=True)
-        for index, run in enumerate(runs, start=1):
-            if index == 1 or index % 10 == 0 or index == len(runs):
-                print(f"[crawl] run {index}/{len(runs)}: {run.run_url}", flush=True)
-            existing_run = conn.execute("SELECT run_id FROM runs WHERE source_run_id = ?", (run.source_run_id,)).fetchone()
-            try:
-                record = parse_run(client, settings, run, filters.request_delay_seconds)
-            except Exception as exc:
-                print(f"[crawl] skipping run after fetch/parse failure: {run.run_url} ({type(exc).__name__})", flush=True)
-                run_failures += 1
-                if existing_run:
-                    active_run_ids.add(existing_run["run_id"])
-                continue
-            if filters.heroes and record["hero"] not in filters.heroes:
-                skipped_filters += 1
-                continue
-            if not _rank_meets_minimum(record["player_rank_tier"], filters.min_rank):
-                skipped_filters += 1
-                continue
-            if existing_run:
-                run_id = existing_run["run_id"]
-                conn.execute(
-                    """
-                    UPDATE runs
-                    SET hero = ?, run_url = ?, created_at = ?, title = ?, profile_name = ?, profile_url = ?, outcome_text = ?, record_wins = ?, record_losses = ?,
-                        run_wins_label = ?, run_victory_tier = ?, run_victory_label = ?, player_rank_tier = COALESCE(?, player_rank_tier), player_rank_label = COALESCE(?, player_rank_label), has_broken_crown = ?, max_health = ?, prestige = ?, level = ?, income = ?, gold = ?, html_path = ?,
-                        card_hints_json = ?, board_cards_json = ?, skill_cards_json = ?, crawled_at = ?
-                    WHERE run_id = ?
-                    """,
-                    (
-                        record["hero"],
-                        record["run_url"],
-                        record["created_at"],
-                        record["title"],
-                        record["profile_name"],
-                        record["profile_url"],
-                        record["outcome_text"],
-                        record["record_wins"],
-                        record["record_losses"],
-                        record["run_wins_label"],
-                        record["run_victory_tier"],
-                        record["run_victory_label"],
-                        record["player_rank_tier"],
-                        record["player_rank_label"],
-                        record["has_broken_crown"],
-                        record["max_health"],
-                        record["prestige"],
-                        record["level"],
-                        record["income"],
-                        record["gold"],
-                        record["html_path"],
-                        json_dumps(record["card_hints"]),
-                        json_dumps(record["board_cards"]),
-                        json_dumps(record["skill_cards"]),
-                        now,
-                        run_id,
-                    ),
+        for scope_index, scope_filters in enumerate(filter_scopes, start=1):
+            if len(filter_scopes) > 1:
+                print(
+                    f"[crawl] hero scope {scope_index}/{len(filter_scopes)}: {', '.join(sorted(scope_filters.heroes))}",
+                    flush=True,
                 )
-            else:
-                run_id = next_id(conn, "runs", "run_id")
-                conn.execute(
-                    """
-                    INSERT INTO runs(run_id, source_run_id, hero, run_url, created_at, title, profile_name, profile_url, outcome_text, record_wins, record_losses,
-                                     run_wins_label, run_victory_tier, run_victory_label, player_rank_tier, player_rank_label, has_broken_crown, max_health, prestige, level,
-                                     income, gold, html_path, card_hints_json, board_cards_json, skill_cards_json, crawled_at)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        run_id,
-                        record["source_run_id"],
-                        record["hero"],
-                        record["run_url"],
-                        record["created_at"],
-                        record["title"],
-                        record["profile_name"],
-                        record["profile_url"],
-                        record["outcome_text"],
-                        record["record_wins"],
-                        record["record_losses"],
-                        record["run_wins_label"],
-                        record["run_victory_tier"],
-                        record["run_victory_label"],
-                        record["player_rank_tier"],
-                        record["player_rank_label"],
-                        record["has_broken_crown"],
-                        record["max_health"],
-                        record["prestige"],
-                        record["level"],
-                        record["income"],
-                        record["gold"],
-                        record["html_path"],
-                        json_dumps(record["card_hints"]),
-                        json_dumps(record["board_cards"]),
-                        json_dumps(record["skill_cards"]),
-                        now,
-                    ),
-                )
-            inserted_runs += 1
-            active_run_ids.add(run_id)
+            discovery = discover_runs(client, settings, scope_filters)
+            discovery_exhausted = discovery_exhausted and discovery.exhausted
+            runs = discovery.runs
+            print(f"[crawl] processing {len(runs)} runs", flush=True)
+            for run, record, error in _parse_discovered_runs(client, settings, runs, scope_filters):
+                existing_run = conn.execute("SELECT run_id FROM runs WHERE source_run_id = ?", (run.source_run_id,)).fetchone()
+                if error is not None or record is None:
+                    exc = error or RuntimeError("unknown parse failure")
+                    print(f"[crawl] skipping run after fetch/parse failure: {run.run_url} ({type(exc).__name__})", flush=True)
+                    run_failures += 1
+                    if existing_run:
+                        active_run_ids.add(existing_run["run_id"])
+                    continue
+                if scope_filters.heroes and record["hero"] not in scope_filters.heroes:
+                    skipped_filters += 1
+                    continue
+                if not _rank_meets_minimum(record["player_rank_tier"], scope_filters.min_rank):
+                    skipped_filters += 1
+                    continue
+                run_id, new_screenshots = _upsert_run_record(conn, run, record, now)
+                inserted_runs += 1
+                inserted_screenshots += new_screenshots
+                active_run_ids.add(run_id)
 
-            existing_screenshots = conn.execute(
-                "SELECT screenshot_id, screenshot_url FROM screenshots WHERE run_id = ?",
-                (run_id,),
-            ).fetchall()
-            existing_screenshot_map = {row["screenshot_url"]: row["screenshot_id"] for row in existing_screenshots}
-            stale_screenshot_ids = [
-                screenshot_id
-                for screenshot_url, screenshot_id in existing_screenshot_map.items()
-                if screenshot_url not in record["screenshot_urls"]
-            ]
-            _delete_screenshots(conn, stale_screenshot_ids)
-            for idx, screenshot_url in enumerate(record["screenshot_urls"]):
-                existing_screenshot_id = existing_screenshot_map.get(screenshot_url)
-                if existing_screenshot_id is not None:
-                    conn.execute(
-                        "UPDATE screenshots SET is_primary = ? WHERE screenshot_id = ?",
-                        (1 if idx == 0 else 0, existing_screenshot_id),
-                    )
-                else:
-                    conn.execute(
-                        """
-                        INSERT INTO screenshots(screenshot_id, run_id, screenshot_url, is_primary)
-                        VALUES(?, ?, ?, ?)
-                        """,
-                        (next_id(conn, "screenshots", "screenshot_id"), run_id, screenshot_url, 1 if idx == 0 else 0),
-                    )
-                    inserted_screenshots += 1
-
-    if discovery.exhausted and run_failures == 0 and _is_full_discovery_scope(filters):
-        removed_runs, removed_screenshots = _delete_stale_runs(conn, active_run_ids)
+    if discovery_exhausted and run_failures == 0 and skipped_filters == 0 and all(_is_full_discovery_scope(scope) for scope in filter_scopes):
+        removed_runs, removed_screenshots = _delete_stale_runs(conn, active_run_ids, filters)
     else:
         removed_runs = 0
         removed_screenshots = 0
         reasons = []
-        if not discovery.exhausted:
+        if not discovery_exhausted:
             reasons.append("discovery_incomplete")
         if run_failures:
             reasons.append(f"run_failures={run_failures}")
-        if not _is_full_discovery_scope(filters):
+        if skipped_filters:
+            reasons.append(f"skipped_filters={skipped_filters}")
+        if not all(_is_full_discovery_scope(scope) for scope in filter_scopes):
             reasons.append("incremental_or_filtered_scope")
         print(f"[crawl] skipped stale-run prune ({', '.join(reasons)})", flush=True)
     conn.commit()
@@ -709,7 +800,7 @@ def crawl_runs(conn, settings: Settings) -> dict[str, int]:
         "screenshots": inserted_screenshots,
         "skipped_filters": skipped_filters,
         "run_failures": run_failures,
-        "discovery_exhausted": 1 if discovery.exhausted else 0,
+        "discovery_exhausted": 1 if discovery_exhausted else 0,
         "removed_runs": removed_runs,
         "removed_screenshots": removed_screenshots,
     }
