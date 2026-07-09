@@ -7,6 +7,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import polars as pl
 from PIL import Image
 
 from .config import Settings
@@ -108,7 +109,7 @@ def _card_slot_position(card: dict, fallback_index: int) -> int:
         return fallback_index
 
 
-def _insert_exact_board_cards(conn, screenshot_id: int, cards: list[dict], lookup: dict[str, dict[str, str]]) -> int:
+def _exact_board_card_rows(screenshot_id: int, cards: list[dict], lookup: dict[str, dict[str, str]]) -> list[tuple]:
     rows: list[tuple[str, tuple]] = []
     ordered_cards = sorted(enumerate(cards), key=lambda item: (_card_slot_position(item[1], item[0]), item[0]))
     for index, card in ordered_cards:
@@ -155,24 +156,48 @@ def _insert_exact_board_cards(conn, screenshot_id: int, cards: list[dict], looku
         )
 
     duplicate_counts = Counter(duplicate_key for duplicate_key, _values in rows)
-    conn.executemany(
-        """
-        INSERT INTO extracted_board_items(screenshot_id, slot_index, entity_id, raw_label, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, duplicate_count, crop_path, top_candidates_json, status)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            (
-                *values[:10],
-                duplicate_counts[duplicate_key],
-                *values[10:],
-            )
-            for duplicate_key, values in rows
-        ],
+    return [
+        (
+            *values[:10],
+            duplicate_counts[duplicate_key],
+            *values[10:],
+        )
+        for duplicate_key, values in rows
+    ]
+
+
+def _insert_board_rows(conn, rows: list[tuple]) -> int:
+    conn.insert_frame(
+        "extracted_board_items",
+        pl.DataFrame(
+            rows,
+            schema=[
+                "screenshot_id",
+                "slot_index",
+                "entity_id",
+                "raw_label",
+                "confidence",
+                "method",
+                "bbox_x",
+                "bbox_y",
+                "bbox_w",
+                "bbox_h",
+                "duplicate_count",
+                "crop_path",
+                "top_candidates_json",
+                "status",
+            ],
+            orient="row",
+        ),
     )
     return len(rows)
 
 
-def _insert_exact_skill_cards(conn, screenshot_id: int, cards: list[dict], lookup: dict[str, dict[str, str]]) -> int:
+def _insert_exact_board_cards(conn, screenshot_id: int, cards: list[dict], lookup: dict[str, dict[str, str]]) -> int:
+    return _insert_board_rows(conn, _exact_board_card_rows(screenshot_id, cards, lookup))
+
+
+def _exact_skill_card_rows(screenshot_id: int, cards: list[dict], lookup: dict[str, dict[str, str]]) -> list[tuple]:
     rows: list[tuple] = []
     ordered_cards = sorted(enumerate(cards), key=lambda item: (_card_slot_position(item[1], item[0]), item[0]))
     for index, card in ordered_cards:
@@ -212,14 +237,37 @@ def _insert_exact_skill_cards(conn, screenshot_id: int, cards: list[dict], looku
                 "ok",
             )
         )
-    conn.executemany(
-        """
-        INSERT INTO extracted_skills(screenshot_id, slot_index, entity_id, raw_label, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, crop_path, top_candidates_json, status)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        rows,
+    return rows
+
+
+def _insert_skill_rows(conn, rows: list[tuple]) -> int:
+    conn.insert_frame(
+        "extracted_skills",
+        pl.DataFrame(
+            rows,
+            schema=[
+                "screenshot_id",
+                "slot_index",
+                "entity_id",
+                "raw_label",
+                "confidence",
+                "method",
+                "bbox_x",
+                "bbox_y",
+                "bbox_w",
+                "bbox_h",
+                "crop_path",
+                "top_candidates_json",
+                "status",
+            ],
+            orient="row",
+        ),
     )
     return len(rows)
+
+
+def _insert_exact_skill_cards(conn, screenshot_id: int, cards: list[dict], lookup: dict[str, dict[str, str]]) -> int:
+    return _insert_skill_rows(conn, _exact_skill_card_rows(screenshot_id, cards, lookup))
 
 
 def _queue_review(conn, screenshot_id: int, detection_type: str, crop_path: str, confidence: float, raw_label: str | None, top_candidates_json: str) -> None:
@@ -493,6 +541,43 @@ def _clear_board_skill_reviews(conn, screenshot_id: int | None = None) -> None:
     _clear_review_types(conn, BOARD_SKILL_REVIEW_TYPES, screenshot_id)
 
 
+def _extract_source_only_batch(conn, screenshots, item_lookup: dict[str, dict[str, str]], skill_lookup: dict[str, dict[str, str]]) -> dict[str, int]:
+    board_rows: list[tuple] = []
+    skill_rows: list[tuple] = []
+    processed = 0
+    progress_interval = 2500
+
+    for index, screenshot in enumerate(screenshots, start=1):
+        screenshot_id = screenshot["screenshot_id"]
+        exact_board_cards = _parse_embedded_cards(screenshot["board_cards_json"])
+        exact_skill_cards = _parse_embedded_cards(screenshot["skill_cards_json"])
+        if exact_board_cards:
+            board_rows.extend(_exact_board_card_rows(screenshot_id, exact_board_cards, item_lookup))
+        if exact_skill_cards:
+            skill_rows.extend(_exact_skill_card_rows(screenshot_id, exact_skill_cards, skill_lookup))
+        processed += 1
+        if index == 1 or index % progress_interval == 0 or index == len(screenshots):
+            print(
+                f"[extract] source-only prepared {index}/{len(screenshots)} screenshots items={len(board_rows)} skills={len(skill_rows)}",
+                flush=True,
+            )
+
+    print(f"[extract] source-only inserting items={len(board_rows)} skills={len(skill_rows)}", flush=True)
+    item_detections = _insert_board_rows(conn, board_rows)
+    skill_detections = _insert_skill_rows(conn, skill_rows)
+    conn.commit()
+    print(
+        f"[extract] done: screenshots={processed}, item_detections={item_detections}, skill_detections={skill_detections}, rank_detections=0",
+        flush=True,
+    )
+    return {
+        "screenshots": processed,
+        "item_detections": item_detections,
+        "skill_detections": skill_detections,
+        "rank_detections": 0,
+    }
+
+
 def extract_board_data(conn, settings: Settings) -> dict[str, int]:
     source_only = os.environ.get("BAZAR_EXTRACT_SOURCE_ONLY", "0") == "1"
     item_features = None
@@ -519,6 +604,7 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
     print("[extract] using source-first item and skill enrichment", flush=True)
     if source_only:
         print("[extract] source-only mode enabled; skipping image fallback, rank, crown, and debug crops", flush=True)
+        return _extract_source_only_batch(conn, screenshots, item_lookup, skill_lookup)
 
     processed = 0
     item_detections = 0

@@ -1,5 +1,7 @@
 import datetime as dt
+import os
 import unittest
+from unittest.mock import patch
 
 from bazar_analysis.crawler import (
     _extract_escaped_json_fragment,
@@ -7,6 +9,7 @@ from bazar_analysis.crawler import (
     _find_json_fragment_end,
     _normalize_embedded_cards,
     _parse_created_timestamp,
+    _should_fetch_detail_html,
 )
 
 
@@ -55,6 +58,12 @@ class CrawlerParsingTests(unittest.TestCase):
         self.assertEqual(_extract_player_rank_tier({"playerRank": "Gold II"}), "Gold")
         self.assertEqual(_extract_player_rank_tier({"profile": {"rankTier": "legendary"}}), "Legendary")
         self.assertIsNone(_extract_player_rank_tier({"playerRank": "wood"}))
+
+    def test_should_skip_detail_html_when_api_payload_is_complete(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BAZAR_CRAWL_FETCH_DETAIL_HTML", None)
+            self.assertFalse(_should_fetch_detail_html({"screenshotUrl": "/cr/run.webp", "items": [{}]}))
+            self.assertTrue(_should_fetch_detail_html({"screenshotUrl": "/cr/run.webp"}))
 
 
 if __name__ == "__main__":

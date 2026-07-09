@@ -170,6 +170,17 @@ def _use_html_cache() -> bool:
     return os.environ.get("BAZAR_CRAWL_USE_HTML_CACHE", "1") != "0"
 
 
+def _should_fetch_detail_html(payload: dict) -> bool:
+    raw_value = os.environ.get("BAZAR_CRAWL_FETCH_DETAIL_HTML", "auto").strip().lower()
+    if raw_value in {"1", "true", "yes", "always"}:
+        return True
+    if raw_value in {"0", "false", "no", "never"}:
+        return False
+    has_screenshot = bool(payload.get("screenshotUrl"))
+    has_cards = bool(payload.get("items") or payload.get("skills"))
+    return not (has_screenshot and has_cards)
+
+
 def _is_unusable_cached_html(html: str) -> bool:
     lowered = html.lower()
     return not html.strip() or ("just a moment" in lowered and "cloudflare" in lowered)
@@ -466,7 +477,7 @@ def parse_run(client: httpx.Client, settings: Settings, run: RunRecord, delay_se
     html = ""
     if _use_html_cache() and html_path.exists():
         html = html_path.read_text(encoding="utf-8")
-    if _is_unusable_cached_html(html):
+    if _is_unusable_cached_html(html) and _should_fetch_detail_html(run.api_payload):
         html = fetch_text(client, run.run_url, delay_seconds)
         save_text(html_path, html)
 

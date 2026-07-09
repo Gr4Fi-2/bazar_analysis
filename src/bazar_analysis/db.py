@@ -251,6 +251,17 @@ class DatabaseConnection:
             cursor.execute(query, parameters)
         return cursor.pl()
 
+    def insert_frame(self, table: str, frame: pl.DataFrame) -> None:
+        if not frame.height:
+            return
+        view_name = f"_insert_{table}"
+        columns = ", ".join(frame.columns)
+        self._conn.register(view_name, frame)
+        try:
+            self._conn.execute(f"INSERT INTO {table}({columns}) SELECT {columns} FROM {view_name}")
+        finally:
+            self._conn.unregister(view_name)
+
     def execute_script(self, script: str) -> None:
         self._conn.execute(script)
 
