@@ -256,16 +256,41 @@ def _fetch_run_api_page(filters: RunFilters, cursor_payload: dict | None) -> lis
     return response.json()
 
 
+def _preceding_backslash_count(text: str, index: int) -> int:
+    count = 0
+    cursor = index - 1
+    while cursor >= 0 and text[cursor] == "\\":
+        count += 1
+        cursor -= 1
+    return count
+
+
+def _fragment_uses_escaped_quotes(text: str, start_index: int) -> bool:
+    for index in range(start_index, len(text)):
+        if text[index] == '"':
+            return _preceding_backslash_count(text, index) == 1
+    return False
+
+
+def _is_json_string_boundary(text: str, index: int, escaped_quotes: bool) -> bool:
+    if text[index] != '"':
+        return False
+    backslashes = _preceding_backslash_count(text, index)
+    if escaped_quotes:
+        return backslashes == 1
+    return backslashes % 2 == 0
+
+
 def _find_json_fragment_end(text: str, start_index: int) -> int | None:
     depth = 0
-    escaped = False
+    in_string = False
+    escaped_quotes = _fragment_uses_escaped_quotes(text, start_index)
     for index in range(start_index, len(text)):
         char = text[index]
-        if escaped:
-            escaped = False
+        if _is_json_string_boundary(text, index, escaped_quotes):
+            in_string = not in_string
             continue
-        if char == "\\":
-            escaped = True
+        if in_string:
             continue
         if char in "{[":
             depth += 1

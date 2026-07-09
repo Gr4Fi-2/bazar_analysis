@@ -186,15 +186,8 @@ def run_analysis_fast(
     """Refresh analysis summaries from run payloads without crawling references or screenshots."""
     settings, conn = _bootstrap()
     if refresh_extraction:
-        previous_source_only = os.environ.get("BAZAR_EXTRACT_SOURCE_ONLY")
-        os.environ["BAZAR_EXTRACT_SOURCE_ONLY"] = "1"
-        try:
+        with _temporary_env({"BAZAR_EXTRACT_SOURCE_ONLY": "1"}):
             typer.echo({"extract_board_data": _run_step("extract_board_data", extract_board_data, conn, settings)})
-        finally:
-            if previous_source_only is None:
-                os.environ.pop("BAZAR_EXTRACT_SOURCE_ONLY", None)
-            else:
-                os.environ["BAZAR_EXTRACT_SOURCE_ONLY"] = previous_source_only
     if export_base_datasets:
         typer.echo({"export_datasets": _run_step("export_datasets", export_datasets, conn, settings)})
     typer.echo({"summarize": _run_step("summarize", summarize, conn, settings)})

@@ -15,14 +15,17 @@ MIN_CORE_BUILD_CLUSTER_BOARDS = 3
 
 
 def _cooccurrence(rows: list[list[str]], left_name: str, right_name: str) -> pl.DataFrame:
-    pairs: list[tuple[str, str]] = []
+    pair_counts: Counter[tuple[str, str]] = Counter()
     for values in rows:
         unique_values = sorted(set(value for value in values if value))
-        pairs.extend(combinations(unique_values, 2))
-    if not pairs:
+        pair_counts.update(combinations(unique_values, 2))
+    if not pair_counts:
         return pl.DataFrame(schema={left_name: pl.String, right_name: pl.String, "count": pl.Int64})
-    frame = pl.DataFrame(pairs, schema=[left_name, right_name], orient="row")
-    return frame.group_by([left_name, right_name]).len(name="count").sort("count", descending=True)
+    return pl.DataFrame(
+        [(left, right, count) for (left, right), count in pair_counts.items()],
+        schema=[left_name, right_name, "count"],
+        orient="row",
+    ).sort("count", descending=True)
 
 
 def _pipeline_coverage_summary(conn) -> pl.DataFrame:
@@ -410,13 +413,12 @@ def _systemic_item_pairs(board_frame: pl.DataFrame, total_boards: int) -> pl.Dat
     item_count_map = dict(zip(item_counts.get_column("item").to_list(), item_counts.get_column("board_count").to_list(), strict=False))
 
     board_lists = board_frame.group_by("screenshot_id").agg(pl.col("item_name")).get_column("item_name").to_list()
-    pair_rows: list[dict[str, float | int | str]] = []
+    pair_counts: Counter[tuple[str, str]] = Counter()
     for values in board_lists:
         unique_values = sorted(set(value for value in values if value))
-        for item_a, item_b in combinations(unique_values, 2):
-            pair_rows.append({"item_a": item_a, "item_b": item_b})
+        pair_counts.update(combinations(unique_values, 2))
 
-    if not pair_rows:
+    if not pair_counts:
         return pl.DataFrame(
             schema={
                 "item_a": pl.String,
@@ -434,13 +436,8 @@ def _systemic_item_pairs(board_frame: pl.DataFrame, total_boards: int) -> pl.Dat
             }
         )
 
-    pair_counts = pl.DataFrame(pair_rows).group_by(["item_a", "item_b"]).len(name="count")
-
     metrics_rows: list[dict[str, float | int | str]] = []
-    for row in pair_counts.iter_rows(named=True):
-        item_a = row["item_a"]
-        item_b = row["item_b"]
-        count = int(row["count"])
+    for (item_a, item_b), count in pair_counts.items():
         count_a = int(item_count_map[item_a])
         count_b = int(item_count_map[item_b])
         support = count / total_boards

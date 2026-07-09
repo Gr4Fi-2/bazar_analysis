@@ -16,6 +16,7 @@ from .vision import (
     CropBox,
     annotate_image,
     candidate_payload,
+    candidate_payload_data,
     default_regions,
     fallback_grid,
     fallback_skill_grid,
@@ -46,6 +47,7 @@ RANK_PROTOTYPES = {
     "Legendary": np.array([0.590, 56.0 / 180.0, 178.2 / 255.0, 177.8 / 255.0, 0.758, 0.348, 0.105, 0.108], dtype=np.float32),
 }
 RANK_CROWN_REVIEW_TYPES = ("rank", "prestige_state")
+BOARD_SKILL_REVIEW_TYPES = ("board_item", "skill", "screenshot_layout", "screenshot_file")
 
 
 def _load_reference_sets(conn):
@@ -107,14 +109,13 @@ def _card_slot_position(card: dict, fallback_index: int) -> int:
 
 
 def _insert_exact_board_cards(conn, screenshot_id: int, cards: list[dict], lookup: dict[str, dict[str, str]]) -> int:
-    inserted_rows: list[tuple[int, str]] = []
+    rows: list[tuple[str, tuple]] = []
     ordered_cards = sorted(enumerate(cards), key=lambda item: (_card_slot_position(item[1], item[0]), item[0]))
     for index, card in ordered_cards:
         slot_index = _card_slot_position(card, index)
         source_title = card.get("title")
         entity_id, resolved_name = _resolve_reference_card(source_title, lookup)
         raw_label = resolved_name or source_title or card.get("base_id") or f"board_{slot_index}"
-        detection_id = next_id(conn, "extracted_board_items", "detection_id")
         payload = json.dumps(
             [
                 {
@@ -131,43 +132,48 @@ def _insert_exact_board_cards(conn, screenshot_id: int, cards: list[dict], looku
             ensure_ascii=True,
             sort_keys=True,
         )
-        conn.execute(
-            """
-            INSERT INTO extracted_board_items(detection_id, screenshot_id, slot_index, entity_id, raw_label, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, duplicate_count, crop_path, top_candidates_json, status)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                detection_id,
-                screenshot_id,
-                slot_index,
-                entity_id,
-                raw_label,
-                1.0,
-                "run_detail_board",
-                0,
-                0,
-                0,
-                0,
-                1,
-                None,
-                payload,
-                "ok",
-            ),
-        )
         duplicate_key = entity_id or f"title:{normalize_name(raw_label)}"
-        inserted_rows.append((detection_id, duplicate_key))
-
-    duplicate_counts = Counter(key for _detection_id, key in inserted_rows)
-    for detection_id, duplicate_key in inserted_rows:
-        conn.execute(
-            "UPDATE extracted_board_items SET duplicate_count = ? WHERE detection_id = ?",
-            (duplicate_counts[duplicate_key], detection_id),
+        rows.append(
+            (
+                duplicate_key,
+                (
+                    screenshot_id,
+                    slot_index,
+                    entity_id,
+                    raw_label,
+                    1.0,
+                    "run_detail_board",
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    payload,
+                    "ok",
+                ),
+            )
         )
-    return len(inserted_rows)
+
+    duplicate_counts = Counter(duplicate_key for duplicate_key, _values in rows)
+    conn.executemany(
+        """
+        INSERT INTO extracted_board_items(screenshot_id, slot_index, entity_id, raw_label, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, duplicate_count, crop_path, top_candidates_json, status)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                *values[:10],
+                duplicate_counts[duplicate_key],
+                *values[10:],
+            )
+            for duplicate_key, values in rows
+        ],
+    )
+    return len(rows)
 
 
 def _insert_exact_skill_cards(conn, screenshot_id: int, cards: list[dict], lookup: dict[str, dict[str, str]]) -> int:
-    inserted = 0
+    rows: list[tuple] = []
     ordered_cards = sorted(enumerate(cards), key=lambda item: (_card_slot_position(item[1], item[0]), item[0]))
     for index, card in ordered_cards:
         slot_index = _card_slot_position(card, index)
@@ -189,13 +195,8 @@ def _insert_exact_skill_cards(conn, screenshot_id: int, cards: list[dict], looku
             ensure_ascii=True,
             sort_keys=True,
         )
-        conn.execute(
-            """
-            INSERT INTO extracted_skills(detection_id, screenshot_id, slot_index, entity_id, raw_label, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, crop_path, top_candidates_json, status)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+        rows.append(
             (
-                next_id(conn, "extracted_skills", "detection_id"),
                 screenshot_id,
                 slot_index,
                 entity_id,
@@ -209,10 +210,16 @@ def _insert_exact_skill_cards(conn, screenshot_id: int, cards: list[dict], looku
                 None,
                 payload,
                 "ok",
-            ),
+            )
         )
-        inserted += 1
-    return inserted
+    conn.executemany(
+        """
+        INSERT INTO extracted_skills(screenshot_id, slot_index, entity_id, raw_label, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, crop_path, top_candidates_json, status)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
 
 
 def _queue_review(conn, screenshot_id: int, detection_type: str, crop_path: str, confidence: float, raw_label: str | None, top_candidates_json: str) -> None:
@@ -467,30 +474,38 @@ def _detect_and_store_rank(conn, settings: Settings, screenshot_id: int, run_id:
     return rank_label, rank_confidence, badge_box
 
 
-def _clear_rank_crown_reviews(conn, screenshot_id: int | None = None) -> None:
-    placeholders = ", ".join("?" for _ in RANK_CROWN_REVIEW_TYPES)
+def _clear_review_types(conn, detection_types: tuple[str, ...], screenshot_id: int | None = None) -> None:
+    placeholders = ", ".join("?" for _ in detection_types)
     if screenshot_id is None:
-        conn.execute(f"DELETE FROM review_queue WHERE detection_type IN ({placeholders})", RANK_CROWN_REVIEW_TYPES)
+        conn.execute(f"DELETE FROM review_queue WHERE detection_type IN ({placeholders})", detection_types)
         return
     conn.execute(
         f"DELETE FROM review_queue WHERE screenshot_id = ? AND detection_type IN ({placeholders})",
-        (screenshot_id, *RANK_CROWN_REVIEW_TYPES),
+        (screenshot_id, *detection_types),
     )
+
+
+def _clear_rank_crown_reviews(conn, screenshot_id: int | None = None) -> None:
+    _clear_review_types(conn, RANK_CROWN_REVIEW_TYPES, screenshot_id)
+
+
+def _clear_board_skill_reviews(conn, screenshot_id: int | None = None) -> None:
+    _clear_review_types(conn, BOARD_SKILL_REVIEW_TYPES, screenshot_id)
 
 
 def extract_board_data(conn, settings: Settings) -> dict[str, int]:
     source_only = os.environ.get("BAZAR_EXTRACT_SOURCE_ONLY", "0") == "1"
-    if source_only:
-        item_features = []
-        skill_features = []
-    else:
-        item_features, skill_features = _load_reference_sets(conn)
+    item_features = None
+    skill_features = None
     item_lookup = _load_reference_lookup(conn, "reference_items")
     skill_lookup = _load_reference_lookup(conn, "reference_skills")
     conn.execute("DELETE FROM extracted_board_items")
     conn.execute("DELETE FROM extracted_skills")
-    conn.execute("DELETE FROM extracted_ranks")
-    conn.execute("DELETE FROM review_queue")
+    if source_only:
+        _clear_board_skill_reviews(conn)
+    else:
+        conn.execute("DELETE FROM extracted_ranks")
+        conn.execute("DELETE FROM review_queue")
     screenshots = conn.execute(
         """
         SELECT s.*, r.title, r.run_victory_tier, r.player_rank_tier, r.prestige, r.card_hints_json, r.board_cards_json, r.skill_cards_json, r.run_url
@@ -522,16 +537,13 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
         card_hints = json.loads(screenshot["card_hints_json"])
         exact_board_cards = _parse_embedded_cards(screenshot["board_cards_json"])
         exact_skill_cards = _parse_embedded_cards(screenshot["skill_cards_json"])
-        if not source_only:
+        if not source_only and (not exact_board_cards or not exact_skill_cards):
+            if item_features is None or skill_features is None:
+                item_features, skill_features = _load_reference_sets(conn)
             matched_item_features = _hint_matched_features(item_features, card_hints)
             matched_skill_features = _hint_matched_features(skill_features, card_hints)
             item_confidence_threshold = 0.30 if matched_item_features is not item_features else 0.38
             skill_confidence_threshold = 0.28 if matched_skill_features is not skill_features else 0.33
-
-        conn.execute("DELETE FROM extracted_board_items WHERE screenshot_id = ?", (screenshot_id,))
-        conn.execute("DELETE FROM extracted_skills WHERE screenshot_id = ?", (screenshot_id,))
-        conn.execute("DELETE FROM extracted_ranks WHERE screenshot_id = ?", (screenshot_id,))
-        conn.execute("DELETE FROM review_queue WHERE screenshot_id = ?", (screenshot_id,))
 
         if exact_board_cards:
             item_detections += _insert_exact_board_cards(conn, screenshot_id, exact_board_cards, item_lookup)
@@ -649,7 +661,7 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
                             {
                                 "variant": variant_name,
                                 "crop_box": {"x": variant_box.x, "y": variant_box.y, "w": variant_box.w, "h": variant_box.h},
-                                "top_candidates": json.loads(candidate_payload(variant_candidates)),
+                                "top_candidates": candidate_payload_data(variant_candidates),
                             }
                             for variant_name, variant_box, variant_candidates in variant_results
                         ],
@@ -658,11 +670,10 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
                     )
                     conn.execute(
                         """
-                        INSERT INTO extracted_board_items(detection_id, screenshot_id, slot_index, entity_id, raw_label, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, duplicate_count, crop_path, top_candidates_json, status)
-                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO extracted_board_items(screenshot_id, slot_index, entity_id, raw_label, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, duplicate_count, crop_path, top_candidates_json, status)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
-                            next_id(conn, "extracted_board_items", "detection_id"),
                             screenshot_id,
                             slot_index,
                             entity_id,
@@ -708,11 +719,10 @@ def extract_board_data(conn, settings: Settings) -> dict[str, int]:
                     payload = candidate_payload(candidates)
                     conn.execute(
                         """
-                        INSERT INTO extracted_skills(detection_id, screenshot_id, slot_index, entity_id, raw_label, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, crop_path, top_candidates_json, status)
-                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO extracted_skills(screenshot_id, slot_index, entity_id, raw_label, confidence, method, bbox_x, bbox_y, bbox_w, bbox_h, crop_path, top_candidates_json, status)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
-                            next_id(conn, "extracted_skills", "detection_id"),
                             screenshot_id,
                             slot_index,
                             entity_id,
@@ -787,8 +797,6 @@ def extract_rank_and_crown(conn, settings: Settings) -> dict[str, int]:
             )
 
         image_path = Path(screenshot["local_path"]) if screenshot["local_path"] else None
-        conn.execute("DELETE FROM extracted_ranks WHERE screenshot_id = ?", (screenshot_id,))
-        _clear_rank_crown_reviews(conn, screenshot_id)
 
         if image_path is None or not image_path.exists() or (screenshot["width"] or 0) < 1000 or (screenshot["height"] or 0) < 600:
             processed += 1

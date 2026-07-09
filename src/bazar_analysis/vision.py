@@ -44,6 +44,15 @@ class MatchCandidate:
 
 
 @dataclass
+class CropSignature:
+    resized: Image.Image
+    resized_array: np.ndarray
+    mean_rgb: tuple[float, float, float]
+    hsv_hist: np.ndarray
+    orb_descriptors: np.ndarray | None
+
+
+@dataclass
 class RankBadgeFeature:
     screenshot_id: int
     tier: str
@@ -101,6 +110,13 @@ def _image_signature(image: Image.Image, size: int = 96) -> tuple[Image.Image, n
     array = np.array(resized)
     mean_rgb = tuple(float(v) for v in array.mean(axis=(0, 1)))
     return resized, array, mean_rgb, _compute_hsv_histogram(array)
+
+
+def _crop_signature(image: Image.Image, orb: cv2.ORB) -> CropSignature:
+    resized, resized_array, mean_rgb, hsv_hist = _image_signature(image)
+    gray = cv2.cvtColor(resized_array, cv2.COLOR_RGB2GRAY)
+    _, descriptors = orb.detectAndCompute(gray, None)
+    return CropSignature(resized, resized_array, mean_rgb, hsv_hist, descriptors)
 
 
 def save_crop(image: Image.Image, crop_box: CropBox, output_path: Path) -> None:
@@ -220,15 +236,11 @@ def rank_badge_variants(box: CropBox) -> list[tuple[str, CropBox]]:
     ]
 
 
-def _candidate_score(crop_image: Image.Image, crop_array: np.ndarray, reference: ReferenceFeature, name_hint: str | None = None) -> MatchCandidate:
-    orb = cv2.ORB_create(nfeatures=128)
-    resized, resized_array, mean_rgb, hsv_hist = _image_signature(crop_image)
-    phash_distance = crop_hash_distance(resized, reference.phash)
-    color_distance = math.sqrt(sum((mean_rgb[idx] - reference.mean_rgb[idx]) ** 2 for idx in range(3))) / 441.67295593
-    hist_score = hsv_hist_similarity(hsv_hist, reference.hsv_hist)
-    gray = cv2.cvtColor(resized_array, cv2.COLOR_RGB2GRAY)
-    _, descriptors = orb.detectAndCompute(gray, None)
-    orb_score = orb_similarity(descriptors, reference.orb_descriptors)
+def _candidate_score(signature: CropSignature, reference: ReferenceFeature, matcher: cv2.BFMatcher, name_hint: str | None = None) -> MatchCandidate:
+    phash_distance = crop_hash_distance(signature.resized, reference.phash)
+    color_distance = math.sqrt(sum((signature.mean_rgb[idx] - reference.mean_rgb[idx]) ** 2 for idx in range(3))) / 441.67295593
+    hist_score = hsv_hist_similarity(signature.hsv_hist, reference.hsv_hist)
+    orb_score = orb_similarity(signature.orb_descriptors, reference.orb_descriptors, matcher)
     hint_score = 0.0
     if name_hint:
         hint_score = fuzz.ratio(normalize_name(name_hint), reference.normalized_name) / 100.0
@@ -256,11 +268,11 @@ def crop_hash_distance(image: Image.Image, reference_hash: imagehash.ImageHash) 
     return int(imagehash.phash(image) - reference_hash)
 
 
-def orb_similarity(descriptors_a: np.ndarray | None, descriptors_b: np.ndarray | None) -> float:
+def orb_similarity(descriptors_a: np.ndarray | None, descriptors_b: np.ndarray | None, matcher: cv2.BFMatcher | None = None) -> float:
     if descriptors_a is None or descriptors_b is None or len(descriptors_a) == 0 or len(descriptors_b) == 0:
         return 0.0
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = matcher.match(descriptors_a, descriptors_b)
+    active_matcher = matcher or cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = active_matcher.match(descriptors_a, descriptors_b)
     if not matches:
         return 0.0
     matches = sorted(matches, key=lambda item: item.distance)
@@ -274,12 +286,14 @@ def hsv_hist_similarity(hist_a: np.ndarray, hist_b: np.ndarray) -> float:
 
 
 def match_crop(crop_image: Image.Image, references: list[ReferenceFeature], name_hints: list[str] | None = None, top_n: int = 5) -> list[MatchCandidate]:
-    hints = name_hints or []
-    crop_array = np.array(crop_image.convert("RGB"))
+    hints = [(hint, normalize_name(hint)) for hint in name_hints or []]
+    orb = cv2.ORB_create(nfeatures=128)
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    signature = _crop_signature(crop_image, orb)
     candidates: list[MatchCandidate] = []
     for reference in references:
-        hint = max(hints, key=lambda item: fuzz.ratio(normalize_name(item), reference.normalized_name), default=None)
-        candidates.append(_candidate_score(crop_image, crop_array, reference, name_hint=hint))
+        hint = max(hints, key=lambda item: fuzz.ratio(item[1], reference.normalized_name), default=(None, None))[0]
+        candidates.append(_candidate_score(signature, reference, matcher, name_hint=hint))
     candidates.sort(key=lambda item: item.confidence, reverse=True)
     return candidates[:top_n]
 
@@ -481,17 +495,21 @@ def annotate_image(image: Image.Image, annotations: list[tuple[CropBox, str, str
     annotated.save(output_path)
 
 
+def candidate_payload_data(candidates: list[MatchCandidate]) -> list[dict]:
+    return [
+        {
+            "entity_id": candidate.entity_id,
+            "name": candidate.name,
+            "confidence": candidate.confidence,
+            "detail": candidate.detail,
+        }
+        for candidate in candidates
+    ]
+
+
 def candidate_payload(candidates: list[MatchCandidate]) -> str:
     return json.dumps(
-        [
-            {
-                "entity_id": candidate.entity_id,
-                "name": candidate.name,
-                "confidence": candidate.confidence,
-                "detail": candidate.detail,
-            }
-            for candidate in candidates
-        ],
+        candidate_payload_data(candidates),
         ensure_ascii=True,
         sort_keys=True,
     )

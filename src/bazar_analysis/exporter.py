@@ -18,10 +18,14 @@ TABLES = [
 def export_datasets(conn, settings: Settings) -> dict[str, int]:
     counts: dict[str, int] = {}
     for table in TABLES:
-        frame = conn.query_pl(f"SELECT * FROM {table}")
-        counts[table] = frame.height
+        row = conn.execute(f"SELECT COUNT(*) AS row_count FROM {table}").fetchone()
+        counts[table] = int(row["row_count"] if row else 0)
         csv_path = settings.exports_dir / f"{table}.csv"
         parquet_path = settings.exports_dir / f"{table}.parquet"
-        frame.write_csv(csv_path)
-        frame.write_parquet(parquet_path)
+        conn.execute(f"COPY (SELECT * FROM {table}) TO {_sql_literal(str(csv_path))} (HEADER, DELIMITER ',')")
+        conn.execute(f"COPY (SELECT * FROM {table}) TO {_sql_literal(str(parquet_path))} (FORMAT PARQUET)")
     return counts
+
+
+def _sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
