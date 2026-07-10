@@ -20,6 +20,11 @@ from .reporting import write_frame_exports
 PERFORMANCE_PRIOR_RUNS = 20.0
 MIN_CORE_BUILD_CLUSTER_BOARDS = 3
 ARCHETYPE_FAMILY_JACCARD_THRESHOLD = 0.50
+CURATED_ARCHETYPE_MIN_BOARDS = 10
+CURATED_ARCHETYPE_MIN_SUPPORT_RATE = 0.0014
+CURATED_ARCHETYPE_CORE_MIN_RATE = 0.50
+CURATED_ARCHETYPE_CORE_MIN_LIFT = 1.50
+CURATED_ARCHETYPE_MAX_CORE_ITEMS = 3
 CARD_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", flags=re.IGNORECASE)
 GOLD_PLUS_TIERS = {"Gold", "Perfect"}
 MECHANIC_LABEL_PATTERNS = [
@@ -936,6 +941,195 @@ def _archetype_report_frame(family_frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def _empty_curated_archetype_report_frame(include_hero: bool = False) -> pl.DataFrame:
+    schema = {
+        "family_id": pl.String,
+        "archetype": pl.String,
+        "is_long_tail": pl.Boolean,
+        "cluster_count": pl.Int64,
+        "board_count": pl.Int64,
+        "presence_pct": pl.Float64,
+        "avg_wins": pl.Float64,
+        "weighted_avg_wins": pl.Float64,
+        "avg_wins_delta": pl.Float64,
+        "gold_plus_rate": pl.Float64,
+        "gold_plus_delta": pl.Float64,
+        "perfect_rate": pl.Float64,
+        "perfect_delta": pl.Float64,
+        "confidence": pl.String,
+        "mechanic_labels": pl.String,
+        "core_items_json": pl.String,
+        "support_items_json": pl.String,
+        "top_skills_json": pl.String,
+        "top_outcome": pl.String,
+        "outcome_distribution_json": pl.String,
+        "player_rank_distribution_json": pl.String,
+    }
+    if include_hero:
+        schema = {"hero": pl.String, **schema}
+    return pl.DataFrame(schema=schema)
+
+
+def _curated_core_entries(raw_json: str | None, global_item_rates: dict[str, float]) -> list[dict[str, float | str]]:
+    entries: list[dict[str, float | str]] = []
+    for name, rate in _json_name_rate_entries(raw_json):
+        global_rate = global_item_rates.get(name, 0.0)
+        lift = (rate / global_rate) if global_rate else None
+        if rate >= CURATED_ARCHETYPE_CORE_MIN_RATE and lift is not None and lift >= CURATED_ARCHETYPE_CORE_MIN_LIFT:
+            entries.append(
+                {
+                    "name": name,
+                    "rate": round(rate, 4),
+                    "global_rate": round(global_rate, 4),
+                    "lift": round(lift, 3),
+                }
+            )
+    return sorted(entries, key=lambda entry: (-float(entry["lift"]), -float(entry["rate"]), str(entry["name"])))[:CURATED_ARCHETYPE_MAX_CORE_ITEMS]
+
+
+def _support_items_json(core_json: str | None, flex_json: str | None) -> str:
+    rates: dict[str, float] = {}
+    for name, rate in [*_json_name_rate_entries(core_json), *_json_name_rate_entries(flex_json)]:
+        rates[name] = max(rates.get(name, 0.0), rate)
+    return _json_name_counts(list(rates.items()))
+
+
+def _curated_min_board_count(total_boards: int) -> int:
+    return max(CURATED_ARCHETYPE_MIN_BOARDS, round(total_boards * CURATED_ARCHETYPE_MIN_SUPPORT_RATE))
+
+
+def _curated_archetype_report(family_frame: pl.DataFrame, board_frame: pl.DataFrame) -> pl.DataFrame:
+    """Collapse low-support families and retain only discriminative core items."""
+    include_hero = "hero" in family_frame.columns
+    if not family_frame.height or not board_frame.height:
+        return _empty_curated_archetype_report_frame(include_hero)
+
+    total_boards = int(board_frame.get_column("screenshot_id").n_unique())
+    if total_boards <= 0:
+        return _empty_curated_archetype_report_frame(include_hero)
+    min_board_count = _curated_min_board_count(total_boards)
+    item_counts = board_frame.select(["screenshot_id", "item_name"]).unique().group_by("item_name").len(name="board_count")
+    global_item_rates = {row["item_name"]: int(row["board_count"]) / total_boards for row in item_counts.iter_rows(named=True)}
+    total_family_boards = int(family_frame.get_column("board_count").sum() or 0)
+    baseline_avg_wins = float(
+        family_frame.select((pl.col("avg_wins") * pl.col("board_count")).sum() / pl.col("board_count").sum()).item() or 0.0
+    )
+    baseline_gold_plus_rate = float(family_frame.get_column("gold_plus_count").sum() or 0) / total_family_boards
+    baseline_perfect_rate = float(family_frame.get_column("perfect_count").sum() or 0) / total_family_boards
+
+    report_rows: list[dict[str, object]] = []
+    tail_rows: list[dict[str, object]] = []
+    for row in family_frame.iter_rows(named=True):
+        if int(row["board_count"]) < min_board_count:
+            tail_rows.append(row)
+            continue
+        core_items = _curated_core_entries(row["core_items_json"], global_item_rates)
+        core_names = [str(entry["name"]) for entry in core_items]
+        report_rows.append(
+            {
+                "family_id": row["family_id"],
+                "archetype": " + ".join(core_names) if core_names else row["family_name"],
+                "is_long_tail": False,
+                "cluster_count": int(row["cluster_count"]),
+                "board_count": int(row["board_count"]),
+                "presence_pct": int(row["board_count"]) / total_boards * 100.0,
+                "avg_wins": row["avg_wins"],
+                "weighted_avg_wins": row["weighted_avg_wins"],
+                "avg_wins_delta": row["avg_wins_delta"],
+                "gold_plus_rate": row["gold_plus_rate"],
+                "gold_plus_delta": row["gold_plus_delta"],
+                "perfect_rate": row["perfect_rate"],
+                "perfect_delta": row["perfect_delta"],
+                "confidence": row["confidence"],
+                "mechanic_labels": row["mechanic_labels"],
+                "core_items_json": json.dumps(core_items, ensure_ascii=True),
+                "support_items_json": _support_items_json(row["core_items_json"], row["flex_items_json"]),
+                "top_skills_json": row["top_skills_json"],
+                "top_outcome": row["top_outcome"],
+                "outcome_distribution_json": row["outcome_distribution_json"],
+                "player_rank_distribution_json": row["player_rank_distribution_json"],
+            }
+        )
+
+    if tail_rows:
+        tail_board_count = sum(int(row["board_count"]) for row in tail_rows)
+        core_counter: dict[str, float] = {}
+        flex_counter: dict[str, float] = {}
+        skill_counter: dict[str, float] = {}
+        outcome_counter: dict[str, int] = {}
+        rank_counter: dict[str, int] = {}
+        for row in tail_rows:
+            board_count = int(row["board_count"])
+            _merge_counter_from_json(core_counter, row["core_items_json"], board_count)
+            _merge_counter_from_json(flex_counter, row["flex_items_json"], board_count)
+            _merge_counter_from_json(skill_counter, row["top_skills_json"], board_count)
+            _merge_count_counter_from_json(outcome_counter, row["outcome_distribution_json"])
+            _merge_count_counter_from_json(rank_counter, row["player_rank_distribution_json"])
+        tail_core_json = _json_name_counts(
+            [(name, support / tail_board_count) for name, support in core_counter.items()],
+            top_n=CURATED_ARCHETYPE_MAX_CORE_ITEMS,
+        )
+        tail_core_items = _curated_core_entries(tail_core_json, global_item_rates)
+        tail_support_rates: dict[str, float] = {}
+        for counter in (core_counter, flex_counter):
+            for name, support in counter.items():
+                tail_support_rates[name] = max(tail_support_rates.get(name, 0.0), support / tail_board_count)
+        tail_support_json = _json_name_counts(list(tail_support_rates.items()))
+        tail_avg_wins = sum(float(row["avg_wins"] or 0.0) * int(row["board_count"]) for row in tail_rows) / tail_board_count
+        tail_gold_plus_count = sum(int(row["gold_plus_count"] or 0) for row in tail_rows)
+        tail_perfect_count = sum(int(row["perfect_count"] or 0) for row in tail_rows)
+        tail_gold_plus_rate = tail_gold_plus_count / tail_board_count
+        tail_perfect_rate = tail_perfect_count / tail_board_count
+        tail_weighted_avg_wins = _weighted_toward_baseline(tail_avg_wins, tail_board_count, baseline_avg_wins)
+        tail_weighted_gold_plus_rate = _weighted_toward_baseline(tail_gold_plus_rate, tail_board_count, baseline_gold_plus_rate) or 0.0
+        tail_weighted_perfect_rate = _weighted_toward_baseline(tail_perfect_rate, tail_board_count, baseline_perfect_rate) or 0.0
+        tail_core_names = [str(entry["name"]) for entry in tail_core_items]
+        report_rows.append(
+            {
+                "family_id": "long_tail",
+                "archetype": f"Long tail (<{min_board_count} boards)",
+                "is_long_tail": True,
+                "cluster_count": sum(int(row["cluster_count"]) for row in tail_rows),
+                "board_count": tail_board_count,
+                "presence_pct": tail_board_count / total_boards * 100.0,
+                "avg_wins": tail_avg_wins,
+                "weighted_avg_wins": tail_weighted_avg_wins,
+                "avg_wins_delta": (tail_weighted_avg_wins - baseline_avg_wins) if tail_weighted_avg_wins is not None else None,
+                "gold_plus_rate": tail_gold_plus_rate,
+                "gold_plus_delta": tail_weighted_gold_plus_rate - baseline_gold_plus_rate,
+                "perfect_rate": tail_perfect_rate,
+                "perfect_delta": tail_weighted_perfect_rate - baseline_perfect_rate,
+                "confidence": "long_tail",
+                "mechanic_labels": _mechanic_labels_json(tail_core_names or _json_names(tail_support_json)),
+                "core_items_json": json.dumps(tail_core_items, ensure_ascii=True),
+                "support_items_json": tail_support_json,
+                "top_skills_json": _json_name_counts(
+                    [(name, support / tail_board_count) for name, support in skill_counter.items() if support / tail_board_count >= 0.10]
+                ),
+                "top_outcome": max(outcome_counter.items(), key=lambda item: (item[1], item[0]))[0] if outcome_counter else None,
+                "outcome_distribution_json": _json_counter(outcome_counter),
+                "player_rank_distribution_json": _json_counter(rank_counter),
+            }
+        )
+
+    if not report_rows:
+        return _empty_curated_archetype_report_frame(include_hero)
+    return (
+        pl.DataFrame(report_rows)
+        .with_columns(
+            pl.col("presence_pct").round(2),
+            pl.col("avg_wins").round(3),
+            pl.col("weighted_avg_wins").round(3),
+            pl.col("avg_wins_delta").round(3),
+            pl.col("gold_plus_rate").round(4),
+            pl.col("gold_plus_delta").round(4),
+            pl.col("perfect_rate").round(4),
+            pl.col("perfect_delta").round(4),
+        )
+        .sort(["is_long_tail", "board_count", "weighted_avg_wins"], descending=[False, True, True])
+    )
+
+
 def _empty_build_cluster_outputs() -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     empty_profiles = pl.DataFrame(
         schema={
@@ -1793,6 +1987,7 @@ def systemic_analysis(conn, settings: Settings) -> dict[str, int]:
     cluster_profile_frame, cluster_component_frame, core_build_frame = _build_cluster_profiles(cluster_assignment_frame, skill_frame)
     family_frame = _build_archetype_families(cluster_profile_frame)
     report_frame = _archetype_report_frame(family_frame)
+    curated_report_frame = _curated_archetype_report(family_frame, board_frame)
     skill_shell_affinity_frame = _entity_shell_affinity(cluster_assignment_frame, skill_frame.select(["screenshot_id", "skill_name"]), "skill_name")
     item_shell_affinity_frame = _entity_shell_affinity(cluster_assignment_frame, board_frame.select(["screenshot_id", "item_name"]), "item_name")
     exact_triplet_frame = _exact_item_triplets(board_frame)
@@ -1846,6 +2041,16 @@ def systemic_analysis(conn, settings: Settings) -> dict[str, int]:
     hero_core_build_frame = pl.concat(hero_core_build_frames, how="diagonal_relaxed") if hero_core_build_frames else pl.DataFrame()
     hero_family_frame = pl.concat(hero_family_frames, how="diagonal_relaxed") if hero_family_frames else pl.DataFrame()
     hero_report_frame = _archetype_report_frame(hero_family_frame)
+    hero_curated_report_frames: list[pl.DataFrame] = []
+    if hero_family_frame.height:
+        for hero in heroes:
+            hero_curated_report = _curated_archetype_report(
+                hero_family_frame.filter(pl.col("hero") == hero).drop("hero"),
+                board_frame.filter(pl.col("hero") == hero),
+            )
+            if hero_curated_report.height:
+                hero_curated_report_frames.append(hero_curated_report.with_columns(pl.lit(hero).alias("hero")).select(["hero", *hero_curated_report.columns]))
+    hero_curated_report_frame = pl.concat(hero_curated_report_frames, how="diagonal_relaxed") if hero_curated_report_frames else _empty_curated_archetype_report_frame(include_hero=True)
     hero_skill_shell_affinity_frame = pl.concat(hero_skill_shell_affinity_frames, how="diagonal_relaxed") if hero_skill_shell_affinity_frames else pl.DataFrame()
     hero_item_shell_affinity_frame = pl.concat(hero_item_shell_affinity_frames, how="diagonal_relaxed") if hero_item_shell_affinity_frames else pl.DataFrame()
     hero_exact_triplet_frame = pl.concat(hero_exact_triplet_frames, how="diagonal_relaxed") if hero_exact_triplet_frames else pl.DataFrame()
@@ -1858,6 +2063,7 @@ def systemic_analysis(conn, settings: Settings) -> dict[str, int]:
     write_frame_exports(core_build_frame, settings.exports_dir / "summary_core_builds")
     write_frame_exports(family_frame, settings.exports_dir / "summary_archetype_families")
     write_frame_exports(report_frame, settings.exports_dir / "summary_archetype_report")
+    write_frame_exports(curated_report_frame, settings.exports_dir / "summary_archetype_report_v3")
     write_frame_exports(skill_shell_affinity_frame, settings.exports_dir / "summary_skill_shell_affinity")
     write_frame_exports(item_shell_affinity_frame, settings.exports_dir / "summary_item_shell_affinity")
     write_frame_exports(exact_triplet_frame, settings.exports_dir / "summary_exact_item_triplets")
@@ -1870,6 +2076,7 @@ def systemic_analysis(conn, settings: Settings) -> dict[str, int]:
     write_frame_exports(hero_core_build_frame, settings.exports_dir / "summary_core_builds_by_hero")
     write_frame_exports(hero_family_frame, settings.exports_dir / "summary_archetype_families_by_hero")
     write_frame_exports(hero_report_frame, settings.exports_dir / "summary_archetype_report_by_hero")
+    write_frame_exports(hero_curated_report_frame, settings.exports_dir / "summary_archetype_report_v3_by_hero")
     write_frame_exports(hero_skill_shell_affinity_frame, settings.exports_dir / "summary_skill_shell_affinity_by_hero")
     write_frame_exports(hero_item_shell_affinity_frame, settings.exports_dir / "summary_item_shell_affinity_by_hero")
     write_frame_exports(hero_exact_triplet_frame, settings.exports_dir / "summary_exact_item_triplets_by_hero")
@@ -1884,6 +2091,7 @@ def systemic_analysis(conn, settings: Settings) -> dict[str, int]:
         "core_builds": core_build_frame.height,
         "archetype_families": family_frame.height,
         "archetype_report_rows": report_frame.height,
+        "archetype_report_v3_rows": curated_report_frame.height,
         "skill_shell_affinity_rows": skill_shell_affinity_frame.height,
         "item_shell_affinity_rows": item_shell_affinity_frame.height,
         "exact_item_triplets": exact_triplet_frame.height,
@@ -1893,6 +2101,7 @@ def systemic_analysis(conn, settings: Settings) -> dict[str, int]:
         "core_builds_by_hero": hero_core_build_frame.height,
         "archetype_families_by_hero": hero_family_frame.height,
         "archetype_report_rows_by_hero": hero_report_frame.height,
+        "archetype_report_v3_rows_by_hero": hero_curated_report_frame.height,
         "exact_item_triplets_by_hero": hero_exact_triplet_frame.height,
     }
 

@@ -8,6 +8,8 @@ from bazar_analysis.analysis import (
     _analysis_filters_from_values,
     _build_archetype_families,
     _cooccurrence,
+    _curated_archetype_report,
+    _curated_min_board_count,
     _filter_analysis_frame,
     _jaccard_similarity,
     _mechanic_labels_for_names,
@@ -113,6 +115,55 @@ class AnalysisCoreTests(unittest.TestCase):
         first = result.row(0, named=True)
         self.assertEqual(first["board_count"], 15)
         self.assertEqual(first["cluster_count"], 2)
+
+    def test_curated_archetype_report_collapses_long_tail_and_uses_lifted_core(self) -> None:
+        families = pl.DataFrame(
+            {
+                "family_id": ["family_001", "family_002"],
+                "family_name": ["A + Shared", "B"],
+                "cluster_count": [2, 1],
+                "board_count": [12, 4],
+                "avg_wins": [8.0, 4.0],
+                "weighted_avg_wins": [7.5, 4.5],
+                "avg_wins_delta": [0.5, -0.5],
+                "gold_plus_count": [8, 1],
+                "gold_plus_rate": [8 / 12, 1 / 4],
+                "gold_plus_delta": [0.2, -0.2],
+                "perfect_count": [2, 0],
+                "perfect_rate": [2 / 12, 0.0],
+                "perfect_delta": [0.1, -0.1],
+                "confidence": ["low", "very_low"],
+                "mechanic_labels": ["[\"General\"]", "[\"General\"]"],
+                "core_items_json": [
+                    json.dumps([{"name": "A", "rate": 1.0}, {"name": "Shared", "rate": 1.0}]),
+                    json.dumps([{"name": "B", "rate": 1.0}]),
+                ],
+                "flex_items_json": ["[]", "[]"],
+                "top_skills_json": ["[]", "[]"],
+                "top_outcome": ["Gold", "Bronze"],
+                "outcome_distribution_json": [json.dumps([{"name": "Gold", "count": 8}]), json.dumps([{"name": "Bronze", "count": 4}])],
+                "player_rank_distribution_json": ["[]", "[]"],
+            }
+        )
+        board = pl.DataFrame(
+            {
+                "screenshot_id": [*range(1, 13), *range(1, 25), *range(1, 5)],
+                "item_name": [*("A" for _ in range(12)), *("Shared" for _ in range(24)), *("B" for _ in range(4))],
+            }
+        )
+
+        result = _curated_archetype_report(families, board)
+
+        self.assertEqual(result.height, 2)
+        main = result.filter(~pl.col("is_long_tail")).row(0, named=True)
+        self.assertEqual(main["archetype"], "A")
+        self.assertEqual(json.loads(main["core_items_json"])[0]["name"], "A")
+        tail = result.filter(pl.col("is_long_tail")).row(0, named=True)
+        self.assertEqual(tail["board_count"], 4)
+
+    def test_curated_min_board_count_scales_with_population(self) -> None:
+        self.assertEqual(_curated_min_board_count(7_460), 10)
+        self.assertEqual(_curated_min_board_count(38_838), 54)
 
 
 if __name__ == "__main__":

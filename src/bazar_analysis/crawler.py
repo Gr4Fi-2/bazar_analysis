@@ -7,15 +7,13 @@ import json
 import os
 from pathlib import Path
 import re
-import time
 from urllib.parse import urljoin, urlparse
 
-import httpx
 from bs4 import BeautifulSoup
-from curl_cffi import requests as curl_requests
 
 from .config import Settings
 from .db import next_id
+from .http_client import BazaarDBRequestError, bazaardb_get
 from .utils import (
     absolute_url,
     canonical_image_url,
@@ -23,10 +21,13 @@ from .utils import (
     json_dumps,
     normalize_player_rank_tier,
     safe_stem_from_url,
+    utc_now_iso,
 )
 
 
 RUNS_URL = "https://bazaardb.gg/run"
+RUN_API_PAGE_SIZE = 20
+DISCOVERY_CHECKPOINT_VERSION = 1
 RUN_PATH_PATTERN = re.compile(r"^/run/([0-9a-f-]+)$", flags=re.IGNORECASE)
 ALL_RUN_HEROES = ("Vanessa", "Stelle", "Dooley", "Pygmalien", "Jules", "Mak", "Karnok")
 RANK_ORDER = {
@@ -54,6 +55,7 @@ class RunRecord:
 class RunDiscoveryResult:
     runs: list[RunRecord]
     exhausted: bool
+    error_status_code: int | None = None
 
 
 @dataclass(frozen=True)
@@ -85,7 +87,7 @@ def _load_run_filters() -> RunFilters:
     pages = None if pages_raw in {"", "0", "all"} else max(1, int(pages_raw))
     sort = os.environ.get("BAZAR_RUN_SORT", "newest").strip().lower()
     order = os.environ.get("BAZAR_RUN_ORDER", "desc").strip().lower()
-    request_delay_seconds = max(0.0, float(os.environ.get("BAZAR_CRAWL_DELAY_SECONDS", "0.35")))
+    request_delay_seconds = max(0.0, float(os.environ.get("BAZAR_CRAWL_DELAY_SECONDS", "1.50")))
     created_after, created_before = _created_bounds_for_date_range(date_range)
     override_after = os.environ.get("BAZAR_RUN_CREATED_AFTER", "").strip()
     override_before = os.environ.get("BAZAR_RUN_CREATED_BEFORE", "").strip()
@@ -150,20 +152,11 @@ def _rank_meets_minimum(rank_tier: str | None, min_rank: str | None) -> bool:
     return RANK_ORDER.get(rank_tier, 0) >= RANK_ORDER[min_rank]
 
 
-def build_client() -> httpx.Client:
-    return httpx.Client(
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-        follow_redirects=True,
-        timeout=30.0,
-    )
-
-
 def save_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    temporary_path = path.with_name(f"{path.name}.tmp")
+    temporary_path.write_text(text, encoding="utf-8")
+    temporary_path.replace(path)
 
 
 def _use_html_cache() -> bool:
@@ -208,33 +201,17 @@ def _sort_value(run_payload: dict, sort: str) -> int | None:
 
 
 def _curl_get(url: str, *, timeout: int, referer: str | None, delay_seconds: float, params: list[tuple[str, str]] | None = None):
-    headers = {"Accept-Language": "en-US,en;q=0.9"}
-    if referer:
-        headers["Referer"] = referer
-
-    last_error: Exception | None = None
-    for attempt in range(1, 5):
-        try:
-            if delay_seconds > 0:
-                time.sleep(delay_seconds)
-            response = curl_requests.get(
-                url,
-                params=params,
-                impersonate=os.environ.get("BAZAR_CURL_IMPERSONATE", "firefox"),
-                timeout=timeout,
-                headers=headers,
-            )
-            response.raise_for_status()
-            return response
-        except Exception as exc:
-            last_error = exc
-            print(f"[crawl] retry {attempt}/4 failed for {url}: {type(exc).__name__}", flush=True)
-            if attempt < 4:
-                time.sleep(max(0.75, delay_seconds or 0.0) * attempt)
-    raise RuntimeError(f"failed to fetch {url}") from last_error
+    return bazaardb_get(
+        url,
+        timeout=timeout,
+        referer=referer,
+        delay_seconds=delay_seconds,
+        params=params,
+        log_prefix="crawl",
+    )
 
 
-def fetch_text(client: httpx.Client, url: str, delay_seconds: float) -> str:
+def fetch_text(url: str, delay_seconds: float) -> str:
     return _curl_get(
         url,
         timeout=60,
@@ -395,11 +372,150 @@ def _snapshot_scope_label(filters: RunFilters) -> str:
     return re.sub(r"[^a-z0-9_.-]+", "-", label.lower()).strip("-") or "runs"
 
 
-def discover_runs(client: httpx.Client, settings: Settings, filters: RunFilters) -> RunDiscoveryResult:
+def _api_page_path(settings: Settings, filters: RunFilters, page_number: int) -> Path:
+    return settings.raw_runs_dir / f"run_api_{_snapshot_scope_label(filters)}_page_{page_number}.json"
+
+
+def _discovery_checkpoint_path(settings: Settings, filters: RunFilters) -> Path:
+    return settings.raw_runs_dir / f"run_api_{_snapshot_scope_label(filters)}_checkpoint.json"
+
+
+def _checkpoint_scope(filters: RunFilters) -> dict[str, object]:
+    return {
+        "heroes": sorted(filters.heroes),
+        "min_rank": filters.min_rank,
+        "date_range": filters.date_range,
+        "pages": filters.pages,
+        "sort": filters.sort,
+        "order": filters.order,
+    }
+
+
+def _write_discovery_checkpoint(
+    settings: Settings,
+    filters: RunFilters,
+    *,
+    last_completed_page: int,
+    complete: bool,
+) -> None:
+    payload = {
+        "version": DISCOVERY_CHECKPOINT_VERSION,
+        "scope": _checkpoint_scope(filters),
+        "created_after": filters.created_after,
+        "created_before": filters.created_before,
+        "last_completed_page": last_completed_page,
+        "complete": complete,
+        "updated_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
+    }
+    save_text(
+        _discovery_checkpoint_path(settings, filters),
+        json.dumps(payload, ensure_ascii=True, sort_keys=True),
+    )
+
+
+def _read_json_list(path: Path) -> list[dict] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, list) or not all(isinstance(entry, dict) for entry in payload):
+        return None
+    return payload
+
+
+def _legacy_cached_resume_state(settings: Settings, filters: RunFilters) -> tuple[int, str | None]:
+    """Recover interrupted pre-checkpoint crawls when their last page was full."""
+    max_age_hours = _resume_max_age_hours()
+    newest_mtime: float | None = None
+    first_mtime: float | None = None
+    last_payload: list[dict] | None = None
+    page_number = 1
+    while True:
+        page_path = _api_page_path(settings, filters, page_number)
+        if not page_path.exists():
+            break
+        page_payload = _read_json_list(page_path)
+        if page_payload is None:
+            break
+        last_payload = page_payload
+        first_mtime = first_mtime or page_path.stat().st_mtime
+        newest_mtime = max(newest_mtime or 0.0, page_path.stat().st_mtime)
+        page_number += 1
+
+    last_page = page_number - 1
+    if last_page <= 0 or last_payload is None or len(last_payload) < RUN_API_PAGE_SIZE or newest_mtime is None:
+        return 0, None
+    age_seconds = max(0.0, dt.datetime.now(dt.UTC).timestamp() - newest_mtime)
+    if age_seconds > max_age_hours * 3600.0:
+        return 0, None
+
+    relative_ranges = {"last24h": dt.timedelta(hours=24), "last3d": dt.timedelta(days=3), "last7d": dt.timedelta(days=7)}
+    inferred_created_after = None
+    if filters.date_range in relative_ranges and first_mtime is not None:
+        crawl_started_at = dt.datetime.fromtimestamp(first_mtime, tz=dt.UTC)
+        inferred_created_after = (crawl_started_at - relative_ranges[filters.date_range]).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    return last_page, inferred_created_after
+
+
+def _resume_max_age_hours() -> float:
+    return max(0.0, float(os.environ.get("BAZAR_CRAWL_RESUME_MAX_AGE_HOURS", "72")))
+
+
+def _resume_discovery(settings: Settings, filters: RunFilters) -> tuple[int, RunFilters]:
+    checkpoint_path = _discovery_checkpoint_path(settings, filters)
+    if checkpoint_path.exists():
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            checkpoint = None
+        if (
+            isinstance(checkpoint, dict)
+            and checkpoint.get("version") == DISCOVERY_CHECKPOINT_VERSION
+            and checkpoint.get("scope") == _checkpoint_scope(filters)
+        ):
+            if checkpoint.get("complete"):
+                return 0, filters
+            last_page = max(0, int(checkpoint.get("last_completed_page") or 0))
+            checkpoint_age = max(0.0, dt.datetime.now(dt.UTC).timestamp() - checkpoint_path.stat().st_mtime)
+            checkpoint_is_recent = checkpoint_age <= _resume_max_age_hours() * 3600.0
+            if (
+                checkpoint_is_recent
+                and last_page
+                and all(_api_page_path(settings, filters, page).exists() for page in range(1, last_page + 1))
+            ):
+                return (
+                    last_page,
+                    replace(
+                        filters,
+                        created_after=checkpoint.get("created_after"),
+                        created_before=checkpoint.get("created_before"),
+                    ),
+                )
+
+    legacy_last_page, inferred_created_after = _legacy_cached_resume_state(settings, filters)
+    if legacy_last_page:
+        if inferred_created_after:
+            filters = replace(filters, created_after=inferred_created_after)
+        _write_discovery_checkpoint(
+            settings,
+            filters,
+            last_completed_page=legacy_last_page,
+            complete=False,
+        )
+    return legacy_last_page, filters
+
+
+def discover_runs(settings: Settings, filters: RunFilters) -> RunDiscoveryResult:
     runs: list[RunRecord] = []
     seen_ids: set[str] = set()
     cursor_payload = None
     exhausted = True
+    request_failed = False
+    error_status_code = None
+    last_completed_page = 0
+    resume_through_page, filters = _resume_discovery(settings, filters)
+    if resume_through_page:
+        print(f"[crawl] resuming discovery from {resume_through_page} cached API pages", flush=True)
     created_after_cutoff = _parse_created_timestamp(filters.created_after)
     created_before_cutoff = _parse_created_timestamp(filters.created_before)
 
@@ -415,17 +531,30 @@ def discover_runs(client: httpx.Client, settings: Settings, filters: RunFilters)
         if filters.pages is not None and page_number > filters.pages:
             exhausted = False
             break
-        print(f"[crawl] api page {page_number}: sort={filters.sort} order={filters.order}", flush=True)
-        try:
-            page_payload = _fetch_run_api_page(filters, cursor_payload)
-        except Exception as exc:
-            exhausted = False
-            print(f"[crawl] stopping discovery after page {page_number - 1}: {type(exc).__name__}", flush=True)
-            break
-        save_text(
-            settings.raw_runs_dir / f"run_api_{_snapshot_scope_label(filters)}_page_{page_number}.json",
-            json.dumps(page_payload, ensure_ascii=True, sort_keys=True),
-        )
+        page_path = _api_page_path(settings, filters, page_number)
+        page_payload = _read_json_list(page_path) if page_number <= resume_through_page else None
+        if page_payload is None:
+            print(f"[crawl] api page {page_number}: sort={filters.sort} order={filters.order}", flush=True)
+            try:
+                page_payload = _fetch_run_api_page(filters, cursor_payload)
+            except Exception as exc:
+                exhausted = False
+                request_failed = True
+                error_status_code = exc.status_code if isinstance(exc, BazaarDBRequestError) else None
+                status = f" HTTP {exc.status_code}" if isinstance(exc, BazaarDBRequestError) and exc.status_code else ""
+                print(
+                    f"[crawl] stopping discovery after page {page_number - 1}:{status} {type(exc).__name__}",
+                    flush=True,
+                )
+                break
+            save_text(page_path, json.dumps(page_payload, ensure_ascii=True, sort_keys=True))
+            _write_discovery_checkpoint(
+                settings,
+                filters,
+                last_completed_page=page_number,
+                complete=False,
+            )
+        last_completed_page = page_number
         page_runs = 0
         reached_created_after_cutoff = False
         for payload in page_payload:
@@ -463,22 +592,29 @@ def discover_runs(client: httpx.Client, settings: Settings, filters: RunFilters)
         if reached_created_after_cutoff:
             print("[crawl] reached created-after cutoff; stopping discovery", flush=True)
             break
-        if len(page_payload) < 20:
+        if len(page_payload) < RUN_API_PAGE_SIZE:
             break
         cursor_payload = page_payload[-1]
         page_number += 1
 
-    return RunDiscoveryResult(runs=runs, exhausted=exhausted)
+    if not request_failed:
+        _write_discovery_checkpoint(
+            settings,
+            filters,
+            last_completed_page=last_completed_page,
+            complete=True,
+        )
+    return RunDiscoveryResult(runs=runs, exhausted=exhausted, error_status_code=error_status_code)
 
 
-def parse_run(client: httpx.Client, settings: Settings, run: RunRecord, delay_seconds: float) -> dict:
+def parse_run(settings: Settings, run: RunRecord, delay_seconds: float) -> dict:
     run_slug = safe_stem_from_url(run.run_url)
     html_path = settings.raw_runs_dir / f"run_{run_slug}.html"
     html = ""
     if _use_html_cache() and html_path.exists():
         html = html_path.read_text(encoding="utf-8")
     if _is_unusable_cached_html(html) and _should_fetch_detail_html(run.api_payload):
-        html = fetch_text(client, run.run_url, delay_seconds)
+        html = fetch_text(run.run_url, delay_seconds)
         save_text(html_path, html)
 
     soup = BeautifulSoup(html, "html.parser")
@@ -630,21 +766,21 @@ def _discovery_filter_scopes(filters: RunFilters) -> list[RunFilters]:
     return [replace(filters, heroes={hero}) for hero in sorted(filters.heroes)]
 
 
-def _parse_discovered_runs(client: httpx.Client, settings: Settings, runs: list[RunRecord], filters: RunFilters):
+def _parse_discovered_runs(settings: Settings, runs: list[RunRecord], filters: RunFilters):
     workers = _crawl_workers()
     if workers <= 1 or len(runs) <= 1:
         for index, run in enumerate(runs, start=1):
             if index == 1 or index % 10 == 0 or index == len(runs):
                 print(f"[crawl] run {index}/{len(runs)}: {run.run_url}", flush=True)
             try:
-                yield run, parse_run(client, settings, run, filters.request_delay_seconds), None
+                yield run, parse_run(settings, run, filters.request_delay_seconds), None
             except Exception as exc:
                 yield run, None, exc
         return
 
     print(f"[crawl] parsing run details with {workers} workers", flush=True)
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_map = {executor.submit(parse_run, client, settings, run, filters.request_delay_seconds): run for run in runs}
+        future_map = {executor.submit(parse_run, settings, run, filters.request_delay_seconds): run for run in runs}
         completed = 0
         for future in as_completed(future_map):
             completed += 1
@@ -770,7 +906,7 @@ def _upsert_run_record(conn, run: RunRecord, record: dict, now: str) -> tuple[in
 
 
 def crawl_runs(conn, settings: Settings) -> dict[str, int]:
-    now = dt.datetime.utcnow().isoformat(timespec="seconds")
+    now = utc_now_iso()
     filters = _load_run_filters()
     inserted_runs = 0
     inserted_screenshots = 0
@@ -778,38 +914,46 @@ def crawl_runs(conn, settings: Settings) -> dict[str, int]:
     run_failures = 0
     active_run_ids: set[int] = set()
     discovery_exhausted = True
+    blocked_status_code: int | None = None
     filter_scopes = _discovery_filter_scopes(filters)
 
-    with build_client() as client:
-        for scope_index, scope_filters in enumerate(filter_scopes, start=1):
-            if len(filter_scopes) > 1:
-                print(
-                    f"[crawl] hero scope {scope_index}/{len(filter_scopes)}: {', '.join(sorted(scope_filters.heroes))}",
-                    flush=True,
-                )
-            discovery = discover_runs(client, settings, scope_filters)
-            discovery_exhausted = discovery_exhausted and discovery.exhausted
-            runs = discovery.runs
-            print(f"[crawl] processing {len(runs)} runs", flush=True)
-            for run, record, error in _parse_discovered_runs(client, settings, runs, scope_filters):
-                existing_run = conn.execute("SELECT run_id FROM runs WHERE source_run_id = ?", (run.source_run_id,)).fetchone()
-                if error is not None or record is None:
-                    exc = error or RuntimeError("unknown parse failure")
-                    print(f"[crawl] skipping run after fetch/parse failure: {run.run_url} ({type(exc).__name__})", flush=True)
-                    run_failures += 1
-                    if existing_run:
-                        active_run_ids.add(existing_run["run_id"])
-                    continue
-                if scope_filters.heroes and record["hero"] not in scope_filters.heroes:
-                    skipped_filters += 1
-                    continue
-                if not _rank_meets_minimum(record["player_rank_tier"], scope_filters.min_rank):
-                    skipped_filters += 1
-                    continue
-                run_id, new_screenshots = _upsert_run_record(conn, run, record, now)
-                inserted_runs += 1
-                inserted_screenshots += new_screenshots
-                active_run_ids.add(run_id)
+    for scope_index, scope_filters in enumerate(filter_scopes, start=1):
+        if len(filter_scopes) > 1:
+            print(
+                f"[crawl] hero scope {scope_index}/{len(filter_scopes)}: {', '.join(sorted(scope_filters.heroes))}",
+                flush=True,
+            )
+        discovery = discover_runs(settings, scope_filters)
+        discovery_exhausted = discovery_exhausted and discovery.exhausted
+        if discovery.error_status_code in {401, 403}:
+            blocked_status_code = discovery.error_status_code
+        runs = discovery.runs
+        print(f"[crawl] processing {len(runs)} runs", flush=True)
+        for run, record, error in _parse_discovered_runs(settings, runs, scope_filters):
+            existing_run = conn.execute("SELECT run_id FROM runs WHERE source_run_id = ?", (run.source_run_id,)).fetchone()
+            if error is not None or record is None:
+                exc = error or RuntimeError("unknown parse failure")
+                print(f"[crawl] skipping run after fetch/parse failure: {run.run_url} ({type(exc).__name__})", flush=True)
+                run_failures += 1
+                if existing_run:
+                    active_run_ids.add(existing_run["run_id"])
+                continue
+            if scope_filters.heroes and record["hero"] not in scope_filters.heroes:
+                skipped_filters += 1
+                continue
+            if not _rank_meets_minimum(record["player_rank_tier"], scope_filters.min_rank):
+                skipped_filters += 1
+                continue
+            run_id, new_screenshots = _upsert_run_record(conn, run, record, now)
+            inserted_runs += 1
+            inserted_screenshots += new_screenshots
+            active_run_ids.add(run_id)
+        if blocked_status_code is not None:
+            print(
+                f"[crawl] HTTP {blocked_status_code} access block detected; skipping remaining hero scopes",
+                flush=True,
+            )
+            break
 
     if discovery_exhausted and run_failures == 0 and skipped_filters == 0 and all(_is_full_discovery_scope(scope) for scope in filter_scopes):
         removed_runs, removed_screenshots = _delete_stale_runs(conn, active_run_ids, filters)
@@ -837,6 +981,7 @@ def crawl_runs(conn, settings: Settings) -> dict[str, int]:
         "skipped_filters": skipped_filters,
         "run_failures": run_failures,
         "discovery_exhausted": 1 if discovery_exhausted else 0,
+        "blocked_status_code": blocked_status_code or 0,
         "removed_runs": removed_runs,
         "removed_screenshots": removed_screenshots,
     }

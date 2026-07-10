@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import datetime as dt
 import json
 import os
 import re
@@ -10,10 +9,10 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-from curl_cffi import requests as curl_requests
 
 from .config import Settings
-from .utils import json_dumps, normalize_name, slugify
+from .http_client import bazaardb_get
+from .utils import json_dumps, normalize_name, slugify, utc_now_iso
 
 try:
     from playwright.sync_api import sync_playwright
@@ -80,13 +79,13 @@ def _is_cloudflare_challenge(html: str) -> bool:
 
 
 def _fetch_bazaardb_text(url: str) -> str:
-    response = curl_requests.get(
+    delay_seconds = max(0.0, int(os.environ.get("BAZAR_REFERENCE_DELAY_MS", "2500")) / 1000.0)
+    response = bazaardb_get(
         url,
-        impersonate=os.environ.get("BAZAR_CURL_IMPERSONATE", "firefox"),
         timeout=60,
-        headers={"Accept-Language": "en-US,en;q=0.9"},
+        delay_seconds=delay_seconds,
+        log_prefix="reference",
     )
-    response.raise_for_status()
     return response.text
 
 
@@ -479,7 +478,7 @@ def _repair_missing_reference_icons(conn, settings: Settings) -> dict[str, int]:
 
 
 def build_reference_catalog(conn, settings: Settings) -> dict[str, int]:
-    now = dt.datetime.utcnow().isoformat(timespec="seconds")
+    now = utc_now_iso()
     counts: dict[str, int] = {"items": 0, "skills": 0}
     repaired = _repair_missing_reference_icons(conn, settings)
     print(f"[reference] repaired icons: {repaired}", flush=True)

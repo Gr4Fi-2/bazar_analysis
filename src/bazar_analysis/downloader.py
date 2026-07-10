@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import datetime as dt
 import hashlib
 import os
 from pathlib import Path
 import time
 
-from curl_cffi import requests as curl_requests
 from PIL import Image
 
 from .config import Settings
+from .http_client import BazaarDBRequestError, bazaardb_get
+from .utils import utc_now_iso
 
 
 def _read_image_metadata(image_path: Path) -> tuple[int, int]:
@@ -30,22 +30,21 @@ def _download_and_validate_image(url: str, output_path: Path, attempts: int = 3)
     delay_seconds = max(0.0, float(os.environ.get("BAZAR_DOWNLOAD_DELAY_SECONDS", "0.20")))
     for attempt in range(1, attempts + 1):
         try:
-            if delay_seconds > 0:
-                time.sleep(delay_seconds)
-            response = curl_requests.get(
+            response = bazaardb_get(
                 url,
-                impersonate=os.environ.get("BAZAR_CURL_IMPERSONATE", "firefox"),
                 timeout=60,
-                headers={
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": "https://bazaardb.gg/run",
-                },
+                referer="https://bazaardb.gg/run",
+                delay_seconds=delay_seconds,
+                max_attempts=attempts,
+                log_prefix="download",
             )
-            response.raise_for_status()
             content = response.content
             output_path.write_bytes(content)
             width, height = _read_image_metadata(output_path)
             return content, width, height
+        except BazaarDBRequestError as exc:
+            output_path.unlink(missing_ok=True)
+            raise RuntimeError(f"failed to download image: {url}") from exc
         except Exception as exc:
             last_error = exc
             output_path.unlink(missing_ok=True)
@@ -131,7 +130,7 @@ def download_screenshots(conn, settings: Settings) -> dict[str, int]:
                 sha256,
                 width,
                 height,
-                dt.datetime.utcnow().isoformat(timespec="seconds"),
+                utc_now_iso(),
                 screenshot_id,
             ),
         )

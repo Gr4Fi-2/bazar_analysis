@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import re
@@ -15,6 +16,11 @@ RUN_VICTORY_LABELS = {
     "Bronze": "Bronze Victory",
     "Unfortunate": "An Unfortunate Journey",
 }
+
+
+def utc_now_iso() -> str:
+    """Return the existing naive-UTC storage format without deprecated utcnow()."""
+    return dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
 def sha256_bytes(value: bytes) -> str:

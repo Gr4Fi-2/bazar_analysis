@@ -297,9 +297,9 @@ def refresh_season_fast(
         help="Parallel workers for run detail parsing. DB writes stay serial.",
     ),
     crawl_delay_seconds: float = typer.Option(
-        0.10,
+        1.50,
         "--crawl-delay-seconds",
-        help="Delay before uncached BazaarDB HTTP requests.",
+        help="Process-wide minimum gap between uncached BazaarDB HTTP requests.",
     ),
     use_html_cache: bool = typer.Option(
         True,

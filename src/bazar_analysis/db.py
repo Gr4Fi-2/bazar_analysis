@@ -255,10 +255,23 @@ class DatabaseConnection:
         if not frame.height:
             return
         view_name = f"_insert_{table}"
-        columns = ", ".join(frame.columns)
-        self._conn.register(view_name, frame)
+        quoted_table = _quote_identifier(table)
+        quoted_columns = ", ".join(_quote_identifier(column) for column in frame.columns)
         try:
-            self._conn.execute(f"INSERT INTO {table}({columns}) SELECT {columns} FROM {view_name}")
+            self._conn.register(view_name, frame)
+        except ModuleNotFoundError as exc:
+            if exc.name != "pyarrow":
+                raise
+            placeholders = ", ".join("?" for _ in frame.columns)
+            query = f"INSERT INTO {quoted_table}({quoted_columns}) VALUES ({placeholders})"
+            for batch in frame.iter_slices(n_rows=10_000):
+                self._conn.executemany(query, list(batch.iter_rows()))
+            return
+        try:
+            quoted_view = _quote_identifier(view_name)
+            self._conn.execute(
+                f"INSERT INTO {quoted_table}({quoted_columns}) SELECT {quoted_columns} FROM {quoted_view}"
+            )
         finally:
             self._conn.unregister(view_name)
 
@@ -270,6 +283,10 @@ class DatabaseConnection:
 
     def close(self) -> None:
         self._conn.close()
+
+
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
 
 
 def _table_exists(conn: DatabaseConnection, table: str) -> bool:

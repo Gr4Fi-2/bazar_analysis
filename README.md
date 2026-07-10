@@ -62,12 +62,15 @@ BAZAR_RUN_DATE_RANGE=latest_season
 BAZAR_RUN_DISCOVERY_PAGES=0
 BAZAR_RUN_SORT=newest
 BAZAR_RUN_ORDER=desc
-BAZAR_CRAWL_DELAY_SECONDS=0.35
+BAZAR_CRAWL_DELAY_SECONDS=1.50
+BAZAR_CRAWL_RESUME_MAX_AGE_HOURS=72
 BAZAR_CRAWL_FETCH_DETAIL_HTML=auto
 BAZAR_DOWNLOAD_DELAY_SECONDS=0.20
 ```
 
 `BAZAR_RUN_DISCOVERY_PAGES=0` means "keep paging until the API feed is exhausted".
+
+Requests are paced process-wide, including concurrent workers. Interrupted discovery runs resume from recent cached API pages; the resume window defaults to 72 hours. HTTP 401/403 stops the remaining hero scopes immediately, while 429 and transient server errors use bounded exponential backoff and honor `Retry-After`.
 
 `latest_season` currently maps to `season15` in code. Known explicit values are `season15`, `season14`, `season13`, `last24h`, `last3d`, and `last7d`.
 
